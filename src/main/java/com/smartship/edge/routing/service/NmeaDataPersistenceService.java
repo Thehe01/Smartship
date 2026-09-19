@@ -1,10 +1,12 @@
 package com.smartship.edge.routing.service;
 
 import com.smartship.edge.config.EdgeProperties;
+import com.smartship.edge.observability.SmartShipMetrics;
 import com.smartship.edge.routing.PersistenceThrottle;
 import com.smartship.edge.routing.ShipDataSourceManager;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
@@ -18,12 +20,29 @@ import java.time.LocalDateTime;
  */
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class NmeaDataPersistenceService {
 
     private final ShipDataSourceManager shipDataSourceManager;
     private final EdgeProperties properties;
     private final PersistenceThrottle throttle;
+    private final SmartShipMetrics metrics;
+
+    @Autowired
+    public NmeaDataPersistenceService(ShipDataSourceManager shipDataSourceManager,
+                                      EdgeProperties properties,
+                                      PersistenceThrottle throttle,
+                                      SmartShipMetrics metrics) {
+        this.shipDataSourceManager = shipDataSourceManager;
+        this.properties = properties;
+        this.throttle = throttle;
+        this.metrics = metrics;
+    }
+
+    public NmeaDataPersistenceService(ShipDataSourceManager shipDataSourceManager,
+                                      EdgeProperties properties,
+                                      PersistenceThrottle throttle) {
+        this(shipDataSourceManager, properties, throttle, null);
+    }
 
     private JdbcTemplate getJdbcTemplate(String mmsi) {
         return shipDataSourceManager.getJdbcTemplate(null, mmsi);
@@ -43,6 +62,7 @@ public class NmeaDataPersistenceService {
                         Integer quality, String gpsStatus, String mmsi) {
         if (!properties.getCollect().getPersist().isEnabled()) return;
         if (mmsi == null || !properties.isSchemaReady()) return;
+        long startNanos = System.nanoTime();
         try {
             String shipId = currentShipId();
             getJdbcTemplate(mmsi).update("""
@@ -56,7 +76,13 @@ public class NmeaDataPersistenceService {
                     lat, lon, speedKnots, course,
                     headingTrue, headingMag, magVar,
                     altitude, satellites, hdop, quality, gpsStatus);
+            if (metrics != null) {
+                metrics.recordPersistenceSuccess("gps", System.nanoTime() - startNanos);
+            }
         } catch (Exception e) {
+            if (metrics != null) {
+                metrics.recordPersistenceFailure("gps", System.nanoTime() - startNanos);
+            }
             log.warn("[Persist-GPS] 写入异常: {}", e.getMessage());
         }
     }
@@ -67,6 +93,7 @@ public class NmeaDataPersistenceService {
                          Double trueAngle, Double trueDirection, Double trueSpeed, String mmsi) {
         if (!properties.getCollect().getPersist().isEnabled()) return;
         if (mmsi == null || !properties.isSchemaReady()) return;
+        long startNanos = System.nanoTime();
         try {
             String shipId = currentShipId();
             getJdbcTemplate(mmsi).update("""
@@ -78,7 +105,13 @@ public class NmeaDataPersistenceService {
                     shipId, mmsi, sentenceType, source, LocalDateTime.now(),
                     apparentAngle, apparentSpeed,
                     trueAngle, trueDirection, trueSpeed);
+            if (metrics != null) {
+                metrics.recordPersistenceSuccess("wind", System.nanoTime() - startNanos);
+            }
         } catch (Exception e) {
+            if (metrics != null) {
+                metrics.recordPersistenceFailure("wind", System.nanoTime() - startNanos);
+            }
             log.warn("[Persist-Wind] 写入异常: {}", e.getMessage());
         }
     }
@@ -87,6 +120,7 @@ public class NmeaDataPersistenceService {
     public void saveDepth(String sentenceType, String source, Double depthM, Double offsetM, String mmsi) {
         if (!properties.getCollect().getPersist().isEnabled()) return;
         if (mmsi == null || !properties.isSchemaReady()) return;
+        long startNanos = System.nanoTime();
         try {
             String shipId = currentShipId();
             getJdbcTemplate(mmsi).update("""
@@ -95,7 +129,13 @@ public class NmeaDataPersistenceService {
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     shipId, mmsi, sentenceType, source, LocalDateTime.now(), depthM, offsetM);
+            if (metrics != null) {
+                metrics.recordPersistenceSuccess("depth", System.nanoTime() - startNanos);
+            }
         } catch (Exception e) {
+            if (metrics != null) {
+                metrics.recordPersistenceFailure("depth", System.nanoTime() - startNanos);
+            }
             log.warn("[Persist-Depth] 写入异常: {}", e.getMessage());
         }
     }
@@ -104,6 +144,7 @@ public class NmeaDataPersistenceService {
     public void saveRudder(String sentenceType, String source, Double rudderAngle, String mmsi) {
         if (!properties.getCollect().getPersist().isEnabled()) return;
         if (mmsi == null || !properties.isSchemaReady()) return;
+        long startNanos = System.nanoTime();
         try {
             String shipId = currentShipId();
             getJdbcTemplate(mmsi).update("""
@@ -111,7 +152,13 @@ public class NmeaDataPersistenceService {
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     shipId, mmsi, sentenceType, source, LocalDateTime.now(), rudderAngle);
+            if (metrics != null) {
+                metrics.recordPersistenceSuccess("rudder", System.nanoTime() - startNanos);
+            }
         } catch (Exception e) {
+            if (metrics != null) {
+                metrics.recordPersistenceFailure("rudder", System.nanoTime() - startNanos);
+            }
             log.warn("[Persist-Rudder] 写入异常: {}", e.getMessage());
         }
     }
@@ -124,6 +171,7 @@ public class NmeaDataPersistenceService {
                            int alarmBits1, int alarmBits2) {
         if (!properties.getCollect().getPersist().isEnabled()) return;
         if (mmsi == null || !properties.isSchemaReady()) return;
+        long startNanos = System.nanoTime();
         try {
             String shipId = currentShipId();
             getJdbcTemplate(mmsi).update("""
@@ -137,7 +185,13 @@ public class NmeaDataPersistenceService {
                     rpm, coolantTemp, lubeOilPress, fuelPress, exhaustTemp,
                     tcAirPress, startAirPress, bearingTemp, batteryVolt,
                     runningHours, status, alarmBits1, alarmBits2);
+            if (metrics != null) {
+                metrics.recordPersistenceSuccess("engine", System.nanoTime() - startNanos);
+            }
         } catch (Exception e) {
+            if (metrics != null) {
+                metrics.recordPersistenceFailure("engine", System.nanoTime() - startNanos);
+            }
             log.warn("[Persist-Engine] 写入异常: {}", e.getMessage());
         }
     }

@@ -1,10 +1,12 @@
 package com.smartship.edge.uploader;
 
 import com.smartship.edge.config.EdgeProperties;
+import com.smartship.edge.observability.SmartShipMetrics;
+import com.smartship.edge.observability.UploadBacklogMetrics;
 import com.smartship.edge.routing.ShipDataSourceManager;
 import com.smartship.edge.uploader.mqtt.MqttPublisher;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -23,26 +25,61 @@ import java.util.Map;
  * 核心架构特性：
  * 1. 本地游标驱动：以 zncb_upload_cursor 记录每张表的最后推送断点 (last_uploaded_id / last_uploaded_time)
  * 2. 失败短路保护：一旦单条消息发送失败（如断网或弱网），坚决执行 break 暂停批次，冻结游标在断点处，恢复后自动续查
+ * 3. 统计增量上报 rows_total 与 batches_total 指标，游标语义严格不变
  */
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class DatabaseUploadPoller {
 
-    public record IncrementalStream(String tableName, String type, String topicSuffix) {}
+    public record IncrementalStream(String streamKey, String tableName, String type, String topicSuffix) {
+        public IncrementalStream(String tableName, String type, String topicSuffix) {
+            this(inferStreamKey(tableName), tableName, type, topicSuffix);
+        }
+
+        private static String inferStreamKey(String tableName) {
+            if (tableName.contains("gps")) return "gps";
+            if (tableName.contains("wind")) return "wind";
+            if (tableName.contains("depth")) return "depth";
+            if (tableName.contains("rudder")) return "rudder";
+            if (tableName.contains("engine")) return "engine";
+            return "unknown";
+        }
+    }
+
     public record SnapshotStream(String tableName, String type, String topicSuffix, String orderColumn) {}
 
     private static final List<IncrementalStream> TELEMETRY_STREAMS = List.of(
-            new IncrementalStream("zncb_gps_data", "nmea_gps", "nmea_gps"),
-            new IncrementalStream("zncb_wind_data", "nmea_wind", "nmea_wind"),
-            new IncrementalStream("zncb_depth_data", "nmea_depth", "nmea_depth"),
-            new IncrementalStream("zncb_rudder_data", "nmea_rudder", "nmea_rudder"),
-            new IncrementalStream("zncb_engine_data", "engine", "engine")
+            new IncrementalStream("gps", "zncb_gps_data", "nmea_gps", "nmea_gps"),
+            new IncrementalStream("wind", "zncb_wind_data", "nmea_wind", "nmea_wind"),
+            new IncrementalStream("depth", "zncb_depth_data", "nmea_depth", "nmea_depth"),
+            new IncrementalStream("rudder", "zncb_rudder_data", "nmea_rudder", "nmea_rudder"),
+            new IncrementalStream("engine", "zncb_engine_data", "engine", "engine")
     );
 
     private final EdgeProperties properties;
     private final ShipDataSourceManager shipDataSourceManager;
     private final MqttPublisher mqttPublisher;
+    private final SmartShipMetrics metrics;
+    private final UploadBacklogMetrics backlogMetrics;
+
+    @Autowired
+    public DatabaseUploadPoller(EdgeProperties properties,
+                                ShipDataSourceManager shipDataSourceManager,
+                                MqttPublisher mqttPublisher,
+                                SmartShipMetrics metrics,
+                                UploadBacklogMetrics backlogMetrics) {
+        this.properties = properties;
+        this.shipDataSourceManager = shipDataSourceManager;
+        this.mqttPublisher = mqttPublisher;
+        this.metrics = metrics;
+        this.backlogMetrics = backlogMetrics;
+    }
+
+    public DatabaseUploadPoller(EdgeProperties properties,
+                                ShipDataSourceManager shipDataSourceManager,
+                                MqttPublisher mqttPublisher) {
+        this(properties, shipDataSourceManager, mqttPublisher, null, null);
+    }
 
     @Scheduled(
             fixedDelayString = "${smartship.edge.uploader.poll.fixed-delay-ms:15000}",
@@ -61,15 +98,24 @@ public class DatabaseUploadPoller {
                     uploadIncrementalStream(jdbcTemplate, ship, stream);
                 }
             } catch (Exception e) {
+                if (metrics != null) {
+                    for (IncrementalStream stream : TELEMETRY_STREAMS) {
+                        metrics.recordUploadBatch(stream.streamKey(), false);
+                    }
+                }
                 log.warn("[Uploader] 轮询推送异常: shipId={}, mmsi={}, err={}",
                         ship.shipId(), ship.mmsi(), e.getMessage());
             }
         }
+        if (backlogMetrics != null) {
+            backlogMetrics.refresh();
+        }
     }
 
-    private void uploadIncrementalStream(JdbcTemplate jdbcTemplate,
-                                         ShipDataSourceManager.ShipDatabase ship,
-                                         IncrementalStream stream) {
+    public void uploadIncrementalStream(JdbcTemplate jdbcTemplate,
+                                        ShipDataSourceManager.ShipDatabase ship,
+                                        IncrementalStream stream) {
+        boolean batchRecorded = false;
         try {
             long lastId = getOrCreateCursorId(jdbcTemplate, stream.tableName());
             int limit = Math.max(1, properties.getUploader().getPoll().getBatchSize());
@@ -86,6 +132,7 @@ public class DatabaseUploadPoller {
 
             long maxSuccessId = lastId;
             int successCount = 0;
+            boolean batchHasFailure = false;
 
             for (Map<String, Object> row : rows) {
                 Object idObj = row.get("id");
@@ -96,7 +143,14 @@ public class DatabaseUploadPoller {
                 if (ok) {
                     maxSuccessId = Math.max(maxSuccessId, rowId);
                     successCount++;
+                    if (metrics != null) {
+                        metrics.recordUploadRows(stream.streamKey(), true, 1);
+                    }
                 } else {
+                    batchHasFailure = true;
+                    if (metrics != null) {
+                        metrics.recordUploadRows(stream.streamKey(), false, 1);
+                    }
                     // 弱网断网保护：立即 break 跳出，绝不继续发送，完整保留断点！
                     log.warn("[Uploader] MQTT 发送失败，短路中断当前批次以冻结续传断点: table={}, failId={}",
                             stream.tableName(), rowId);
@@ -110,7 +164,15 @@ public class DatabaseUploadPoller {
                 log.info("[Uploader] 上传成功: shipId={}, table={}, count={}, 游标推进: {} -> {}",
                         ship.shipId(), stream.tableName(), successCount, lastId, maxSuccessId);
             }
+
+            if (metrics != null) {
+                batchRecorded = true;
+                metrics.recordUploadBatch(stream.streamKey(), !batchHasFailure);
+            }
         } catch (Exception e) {
+            if (!batchRecorded && metrics != null) {
+                metrics.recordUploadBatch(stream.streamKey(), false);
+            }
             log.warn("[Uploader] 增量表查询/上报异常: table={}, err={}", stream.tableName(), e.getMessage());
         }
     }

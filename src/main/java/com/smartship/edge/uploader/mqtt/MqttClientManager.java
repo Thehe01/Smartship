@@ -1,30 +1,58 @@
 package com.smartship.edge.uploader.mqtt;
 
 import com.smartship.edge.config.EdgeProperties;
+import com.smartship.edge.observability.SmartShipMetrics;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.binder.MeterBinder;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.eclipse.paho.client.mqttv3.MqttClient;
-import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
-import org.eclipse.paho.client.mqttv3.MqttException;
-import org.eclipse.paho.client.mqttv3.MqttMessage;
+import org.eclipse.paho.client.mqttv3.*;
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
 /**
  * 边端到岸端 MQTT 客户端生命周期管理器
  * <p>
- * 采用 Paho MQTT 客户端，配置自动重连与 QoS 1 保证至少送达一次
+ * 采用 Paho MQTT 客户端，配置自动重连与 QoS 1 保证至少送达一次。
+ * 集成 Micrometer 指标暴露连接状态 Gauge、连接/重连/断连 Counter 及发布性能 Timer。
  */
 @Slf4j
 @Component
-@RequiredArgsConstructor
-public class MqttClientManager {
+public class MqttClientManager implements MeterBinder {
 
     private final EdgeProperties properties;
+    private final SmartShipMetrics metrics;
     private MqttClient client;
+
+    @Autowired
+    public MqttClientManager(EdgeProperties properties, SmartShipMetrics metrics) {
+        this.properties = properties;
+        this.metrics = metrics;
+    }
+
+    public MqttClientManager(EdgeProperties properties) {
+        this(properties, null);
+    }
+
+    @Override
+    public void bindTo(MeterRegistry registry) {
+        Gauge.builder("smartship_mqtt_connected", this, mgr -> mgr.isConnected() ? 1.0 : 0.0)
+                .description("MQTT connection status (1 = connected, 0 = disconnected)")
+                .register(registry);
+    }
+
+    public boolean isConnected() {
+        try {
+            return client != null && client.isConnected();
+        } catch (Exception e) {
+            return false;
+        }
+    }
 
     @PostConstruct
     public void init() {
@@ -53,9 +81,43 @@ public class MqttClientManager {
                 options.setPassword(mqtt.getPassword() == null ? new char[0] : mqtt.getPassword().toCharArray());
             }
 
+            client.setCallback(new MqttCallbackExtended() {
+                @Override
+                public void connectComplete(boolean reconnect, String serverURI) {
+                    if (reconnect) {
+                        if (metrics != null) {
+                            metrics.recordMqttReconnect();
+                        }
+                        log.info("[MQTT] 自动重连成功: uri={}", serverURI);
+                    }
+                }
+
+                @Override
+                public void connectionLost(Throwable cause) {
+                    if (metrics != null) {
+                        metrics.recordMqttConnectionLost();
+                    }
+                    log.warn("[MQTT] 连接中断: {}", cause != null ? cause.getMessage() : "unknown");
+                }
+
+                @Override
+                public void messageArrived(String topic, MqttMessage message) {
+                }
+
+                @Override
+                public void deliveryComplete(IMqttDeliveryToken token) {
+                }
+            });
+
             client.connect(options);
+            if (metrics != null) {
+                metrics.recordMqttConnect(true);
+            }
             log.info("[MQTT] 成功连接至岸端 Broker: {}, ClientId: {}", mqtt.getBrokerUrl(), clientId);
         } catch (Exception e) {
+            if (metrics != null) {
+                metrics.recordMqttConnect(false);
+            }
             log.warn("[MQTT] 连接 Broker 失败 (弱网离线，稍后将自动重试): {}", e.getMessage());
         }
     }
@@ -64,10 +126,14 @@ public class MqttClientManager {
         if (!properties.getUploader().getMqtt().isEnabled()) {
             return false;
         }
+        long startNanos = System.nanoTime();
         if (client == null || !client.isConnected()) {
             connect();
         }
         if (client == null || !client.isConnected()) {
+            if (metrics != null) {
+                metrics.recordMqttPublish(false, System.nanoTime() - startNanos);
+            }
             return false;
         }
         try {
@@ -75,8 +141,14 @@ public class MqttClientManager {
             message.setQos(properties.getUploader().getMqtt().getQos());
             message.setRetained(false);
             client.publish(topic, message);
+            if (metrics != null) {
+                metrics.recordMqttPublish(true, System.nanoTime() - startNanos);
+            }
             return true;
-        } catch (MqttException e) {
+        } catch (Exception e) {
+            if (metrics != null) {
+                metrics.recordMqttPublish(false, System.nanoTime() - startNanos);
+            }
             log.warn("[MQTT] 发布失败 topic={}, err={}", topic, e.getMessage());
             return false;
         }
