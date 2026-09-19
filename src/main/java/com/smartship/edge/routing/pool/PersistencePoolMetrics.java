@@ -72,6 +72,9 @@ public class PersistencePoolMetrics {
 
     /**
      * 获取线程池已完成执行任务总数
+     * <p>
+     * 注意：仅代表线程池任务执行结束（无论持久化操作成功还是在 catch 中处理了异常），
+     * 不代表实际成功写入 MySQL 的记录数。底层业务写入成功/失败统计将在 P1-3 独立接入。
      */
     public long getCompletedTaskCount() {
         ThreadPoolExecutor tpe = persistenceExecutor.getThreadPoolExecutor();

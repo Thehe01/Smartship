@@ -22,13 +22,15 @@ public class MonitoredCallerRunsPolicy implements RejectedExecutionHandler {
 
     @Override
     public void rejectedExecution(Runnable r, ThreadPoolExecutor executor) {
-        if (executor.isShutdown()) {
-            log.error("[PersistencePool] executor 已关闭，拒绝新任务");
+        if (executor == null || executor.isShutdown()) {
+            log.error("[PersistencePool] executor 已关闭或为空，拒绝新任务");
             throw new RejectedExecutionException("persistenceExecutor already shutdown");
         }
         long current = rejectCount.incrementAndGet();
         log.warn("[PersistencePool] 异步持久化队列已满，触发 CallerRuns 降级反压并在调用者线程同步执行: rejectCount={}", current);
-        r.run();
+        if (r != null) {
+            r.run();
+        }
     }
 
     public long getRejectCount() {

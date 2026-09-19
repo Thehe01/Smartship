@@ -32,7 +32,9 @@ public class PersistenceAsyncConfig {
     @Bean(name = "persistenceExecutor")
     public ThreadPoolTaskExecutor persistenceExecutor(MonitoredCallerRunsPolicy rejectionPolicy) {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        EdgeProperties.PoolConfig pool = properties.getCollect().getPersist().getPool();
+        EdgeProperties.PoolConfig pool = (properties != null && properties.getCollect() != null && properties.getCollect().getPersist() != null)
+                ? properties.getCollect().getPersist().getPool()
+                : null;
 
         int coreSize = pool != null ? pool.getCoreSize() : 2;
         int maxSize = pool != null ? pool.getMaxSize() : 4;
