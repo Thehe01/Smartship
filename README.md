@@ -98,6 +98,10 @@ smartship-edge-core/
 │   │   │   │   ├── ShipDataSourceManager.java
 │   │   │   │   ├── PersistenceThrottle.java
 │   │   │   │   ├── ShipAutoRegisterService.java
+│   │   │   │   ├── pool/                     # 异步持久化有界线程池与可观测性监控指标
+│   │   │   │   │   ├── PersistenceAsyncConfig.java
+│   │   │   │   │   ├── MonitoredCallerRunsPolicy.java
+│   │   │   │   │   └── PersistencePoolMetrics.java
 │   │   │   │   └── service/                  # NmeaDataPersistenceService
 │   │   │   ├── uploader/                     # [模块四] MQTT 增量上报与幂等指纹
 │   │   │   │   ├── DatabaseUploadPoller.java
@@ -113,6 +117,7 @@ smartship-edge-core/
 │           ├── AisPayloadDecoderTest.java    # AIS 6-bit 算法测试
 │           ├── ModbusTcpCodecTest.java       # Modbus TCP MBAP 编解码与半包粘包重组测试
 │           ├── NmeaChecksumTest.java         # NMEA 校验与经纬度转换测试
+│           ├── PersistencePoolTest.java      # 异步持久化专用有界线程池与反压降级测试
 │           ├── PersistenceThrottleTest.java  # 无锁 CAS 50线程并发压测
 │           ├── ShipSchemaIsolationTest.java  # 分船库与主库表结构彻底物理隔离测试
 │           ├── StaticMmsiInitTest.java       # 静态 MMSI 启动自注册生命周期测试

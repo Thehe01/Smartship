@@ -27,6 +27,12 @@ smartship:
       persist:
         enabled: true
         min-write-interval-seconds: 1 # [模块三] CAS 写入节流最小间隔（秒）
+        pool:
+          core-size: 2                # 核心持久化工作线程数
+          max-size: 4                 # 最大持久化工作线程数
+          queue-capacity: 500         # 有界持久化任务缓冲队列容量
+          keep-alive-seconds: 60
+          await-termination-seconds: 30 # 优雅停机等待超时（秒）
       nmea:
         serial:
           enabled: true

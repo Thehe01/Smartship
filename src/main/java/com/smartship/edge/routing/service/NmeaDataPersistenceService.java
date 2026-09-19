@@ -35,7 +35,7 @@ public class NmeaDataPersistenceService {
         return (sid != null && !sid.isEmpty()) ? sid : mmsi;
     }
 
-    @Async
+    @Async("persistenceExecutor")
     public void saveGps(String sentenceType, String source,
                         Double lat, Double lon, Double speedKnots, Double course,
                         Double headingTrue, Double headingMag, Double magVar,
@@ -61,7 +61,7 @@ public class NmeaDataPersistenceService {
         }
     }
 
-    @Async
+    @Async("persistenceExecutor")
     public void saveWind(String sentenceType, String source,
                          Double apparentAngle, Double apparentSpeed,
                          Double trueAngle, Double trueDirection, Double trueSpeed, String mmsi) {
@@ -83,7 +83,7 @@ public class NmeaDataPersistenceService {
         }
     }
 
-    @Async
+    @Async("persistenceExecutor")
     public void saveDepth(String sentenceType, String source, Double depthM, Double offsetM, String mmsi) {
         if (!properties.getCollect().getPersist().isEnabled()) return;
         if (mmsi == null || !properties.isSchemaReady()) return;
@@ -100,7 +100,7 @@ public class NmeaDataPersistenceService {
         }
     }
 
-    @Async
+    @Async("persistenceExecutor")
     public void saveRudder(String sentenceType, String source, Double rudderAngle, String mmsi) {
         if (!properties.getCollect().getPersist().isEnabled()) return;
         if (mmsi == null || !properties.isSchemaReady()) return;
@@ -116,7 +116,7 @@ public class NmeaDataPersistenceService {
         }
     }
 
-    @Async
+    @Async("persistenceExecutor")
     public void saveEngine(String mmsi, int slaveId, double rpm, double coolantTemp,
                            double lubeOilPress, double fuelPress, double exhaustTemp,
                            double tcAirPress, double startAirPress, double bearingTemp,

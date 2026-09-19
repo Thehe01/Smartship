@@ -27,6 +27,16 @@ public class EdgeProperties {
     public static class Persist {
         private boolean enabled = true;
         private int minWriteIntervalSeconds = 1;
+        private PoolConfig pool = new PoolConfig();
+    }
+
+    @Data
+    public static class PoolConfig {
+        private int coreSize = 2;
+        private int maxSize = 4;
+        private int queueCapacity = 500;
+        private int keepAliveSeconds = 60;
+        private int awaitTerminationSeconds = 30;
     }
 
     @Data
