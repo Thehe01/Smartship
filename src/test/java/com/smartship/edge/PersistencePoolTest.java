@@ -9,6 +9,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -157,5 +159,33 @@ class PersistencePoolTest {
         } finally {
             smallExecutor.destroy();
         }
+    }
+
+    @Test
+    @DisplayName("测试线程池关闭后触发 RejectedExecutionException 且不累计降级计数")
+    void testShutdownRejectionBehavior() {
+        ThreadPoolTaskExecutor smallExecutor = new ThreadPoolTaskExecutor();
+        MonitoredCallerRunsPolicy policy = new MonitoredCallerRunsPolicy();
+        smallExecutor.setCorePoolSize(1);
+        smallExecutor.setMaxPoolSize(1);
+        smallExecutor.setQueueCapacity(2);
+        smallExecutor.setThreadNamePrefix("test-shutdown-");
+        smallExecutor.setRejectedExecutionHandler(policy);
+        smallExecutor.initialize();
+
+        ThreadPoolExecutor tpe = smallExecutor.getThreadPoolExecutor();
+        assertNotNull(tpe);
+        smallExecutor.destroy();
+
+        assertTrue(tpe.isShutdown(), "线程池应处于已关闭状态");
+
+        RejectedExecutionException ex = assertThrows(
+                RejectedExecutionException.class,
+                () -> policy.rejectedExecution(() -> {}, tpe),
+                "已关闭的线程池调用拒绝策略必须抛出 RejectedExecutionException"
+        );
+        assertTrue(ex.getMessage().contains("already shutdown"),
+                "异常信息应包含 already shutdown，当前为: " + ex.getMessage());
+        assertEquals(0, policy.getRejectCount(), "关闭期拒绝不应计入 CallerRuns 降级反压指标");
     }
 }

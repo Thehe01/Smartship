@@ -71,7 +71,7 @@ public class PersistencePoolMetrics {
     }
 
     /**
-     * 获取已完成写入的历史任务总数
+     * 获取线程池已完成执行任务总数
      */
     public long getCompletedTaskCount() {
         ThreadPoolExecutor tpe = persistenceExecutor.getThreadPoolExecutor();
