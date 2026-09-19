@@ -1,0 +1,70 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: smartship-edge-core
+  datasource:
+    # 船端主认证与船舶元数据注册库
+    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3306}/zncb_auth?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
+    username: ${MYSQL_USER:root}
+    password: ${MYSQL_PASS:123456}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 5
+      minimum-idle: 1
+      connection-timeout: 3000
+
+# 边缘计算引擎配置
+smartship:
+  edge:
+    # 基础与静态身份配置（若留空则自动通过 AIS !AIVDO 报文动态识别本船 MMSI）
+    mmsi: ""
+    ship-id: ""
+
+    # [模块一] 物理与协议接入配置
+    collect:
+      persist:
+        enabled: true
+        min-write-interval-seconds: 1 # [模块三] CAS 写入节流最小间隔（秒）
+      nmea:
+        serial:
+          enabled: true
+          port: "auto"               # "auto" 自动探测 USB/物理串口，或指定 "COM3", "/dev/ttyUSB0"
+          baud-rate: 9600
+          data-bits: 8
+          stop-bits: 1
+          parity: "none"
+        tcp:
+          enabled: false
+          host: "127.0.0.1"
+          port: 9001
+        udp:
+          enabled: false
+          port: 9002
+
+    # [模块三] 动态分船数据库路由配置
+    datasource:
+      ship:
+        default-host: "localhost"
+        default-port: 3306
+        default-username: "root"
+        default-password: "123456"
+        maximum-pool-size: 5         # 边缘工控机配额约束
+        jdbc-params: "useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false"
+
+    # [模块四] MQTT 上报链路配置
+    uploader:
+      enabled: true
+      poll:
+        fixed-delay-ms: 15000        # 定时增量轮询周期（毫秒）
+        initial-delay-ms: 5000
+        batch-size: 100              # 单批次最大拉取记录数
+      mqtt:
+        enabled: true
+        broker-url: "tcp://broker.emqx.io:1883" # 默认公共测试 Broker
+        client-id: "smartship_edge_demo"
+        qos: 1                       # QoS 1 保证至少到达一次
+        auto-reconnect: true
+        keep-alive-interval: 60
+        connection-timeout: 10
