@@ -16,6 +16,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.TreeMap;
 
 /**
  * MQTT 消息发布与确定性业务指纹计算器
@@ -64,8 +65,13 @@ public class MqttPublisher {
         
         String canonical;
         if ("unknown".equals(sourceIdentity) && "unknown".equals(sourceTime)) {
-            // 兜底防撞：若无显式主键与时间戳，以有序载荷内容为指纹基准，杜绝不同快照碰撞同一 msg_id
-            canonical = mmsi + "|" + type + "|payload:" + row;
+            // 兜底防撞：若无显式主键与时间戳，转换为基于 key 严格字典序排序的规范 JSON 散列，杜绝 Map 迭代顺序差异导致指纹漂移
+            try {
+                Map<String, Object> sortedMap = new TreeMap<>(row);
+                canonical = mmsi + "|" + type + "|payload:" + MAPPER.writeValueAsString(sortedMap);
+            } catch (Exception e) {
+                canonical = mmsi + "|" + type + "|payload:" + row;
+            }
         } else {
             canonical = mmsi + "|" + type + "|" + sourceIdentity + "|" + sourceTime;
         }

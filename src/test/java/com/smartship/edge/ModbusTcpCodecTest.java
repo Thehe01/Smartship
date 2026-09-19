@@ -156,4 +156,41 @@ class ModbusTcpCodecTest {
         assertEquals(0x0102, res.registers()[0]);
         assertEquals(0x0304, res.registers()[1]);
     }
+
+    @Test
+    @DisplayName("测试 Modbus TCP 事务一致性校验成功（TxId / UnitId / FuncCode 匹配）")
+    void testValidateResponseSuccess() {
+        ModbusTcpRequest request = ModbusTcpRequest.readHoldingRegisters(102, 1, 0, 16);
+        ModbusTcpResponse response = new ModbusTcpResponse(
+                102, 0, 1, 0x03, false, 0, new byte[0], new int[]{10, 20}
+        );
+
+        assertDoesNotThrow(() -> ModbusTcpCodec.validateResponse(request, response));
+    }
+
+    @Test
+    @DisplayName("测试 Modbus TCP 事务 ID 不匹配时抛出 ModbusProtocolException")
+    void testValidateResponseTxMismatch() {
+        ModbusTcpRequest request = ModbusTcpRequest.readHoldingRegisters(102, 1, 0, 16);
+        ModbusTcpResponse mismatchedTxResponse = new ModbusTcpResponse(
+                103, 0, 1, 0x03, false, 0, new byte[0], new int[]{10, 20}
+        );
+
+        ModbusProtocolException ex = assertThrows(ModbusProtocolException.class,
+                () -> ModbusTcpCodec.validateResponse(request, mismatchedTxResponse));
+        assertTrue(ex.getMessage().contains("Transaction ID Mismatch"));
+    }
+
+    @Test
+    @DisplayName("测试 Modbus TCP 从站单元 ID 不匹配时抛出 ModbusProtocolException")
+    void testValidateResponseUnitMismatch() {
+        ModbusTcpRequest request = ModbusTcpRequest.readHoldingRegisters(102, 1, 0, 16);
+        ModbusTcpResponse mismatchedUnitResponse = new ModbusTcpResponse(
+                102, 0, 2, 0x03, false, 0, new byte[0], new int[]{10, 20}
+        );
+
+        ModbusProtocolException ex = assertThrows(ModbusProtocolException.class,
+                () -> ModbusTcpCodec.validateResponse(request, mismatchedUnitResponse));
+        assertTrue(ex.getMessage().contains("Unit ID Mismatch"));
+    }
 }

@@ -40,5 +40,9 @@ class ShipSchemaIsolationTest {
                 "主认证库 schema/auth-schema.sql 必须包含 ship_database_registry 注册表");
         assertFalse(authSql.contains("CREATE TABLE IF NOT EXISTS zncb_gps_data"),
                 "主认证库不应混杂分船业务时序表");
+
+        // 验证旧的混合文件已被彻底删除
+        ClassPathResource legacyRes = new ClassPathResource("schema/serialdata-schema.sql");
+        assertFalse(legacyRes.exists(), "旧的混合表结构文件 schema/serialdata-schema.sql 必须已被彻底删除，拒绝兼容回退");
     }
 }

@@ -175,4 +175,46 @@ public class ModbusTcpCodec {
             totalRead += read;
         }
     }
+
+    /**
+     * 严格校验响应报文与发起请求的协议一致性
+     * <p>
+     * 校验要素：
+     * 1. Transaction ID: 请求事务 ID 与响应事务 ID 必须完全一致
+     * 2. Protocol ID: 响应协议 ID 必须为 0
+     * 3. Unit ID: 请求单元 ID 与响应单元 ID 必须一致
+     * 4. Function Code: 正常响应必须等于请求功能码；异常响应必须等于请求功能码 | 0x80
+     *
+     * @param req 发起的请求
+     * @param res 收到的响应
+     * @throws ModbusProtocolException 当校验不通过时抛出
+     */
+    public static void validateResponse(ModbusTcpRequest req, ModbusTcpResponse res) {
+        if (req == null || res == null) {
+            throw new IllegalArgumentException("请求或响应对象不能为空");
+        }
+        if (req.transactionId() != res.transactionId()) {
+            throw new ModbusProtocolException("Modbus 事务 ID 不匹配 (Transaction ID Mismatch): 期望="
+                    + req.transactionId() + ", 实际=" + res.transactionId());
+        }
+        if (res.protocolId() != 0) {
+            throw new ModbusProtocolException("非法的 Modbus 响应协议标识符: " + res.protocolId());
+        }
+        if (req.unitId() != res.unitId()) {
+            throw new ModbusProtocolException("Modbus 从站单元 ID 不匹配 (Unit ID Mismatch): 期望="
+                    + req.unitId() + ", 实际=" + res.unitId());
+        }
+        if (res.isException()) {
+            int expectedExceptionFunc = req.functionCode() | 0x80;
+            if (res.functionCode() != expectedExceptionFunc) {
+                throw new ModbusProtocolException("Modbus 异常响应功能码不匹配: 期望 0x"
+                        + Integer.toHexString(expectedExceptionFunc) + ", 实际 0x" + Integer.toHexString(res.functionCode()));
+            }
+        } else {
+            if (res.functionCode() != req.functionCode()) {
+                throw new ModbusProtocolException("Modbus 响应功能码不匹配: 期望 0x"
+                        + Integer.toHexString(req.functionCode()) + ", 实际 0x" + Integer.toHexString(res.functionCode()));
+            }
+        }
+    }
 }

@@ -13,7 +13,7 @@ import java.nio.charset.StandardCharsets;
 /**
  * 船舶自注册与动态建表服务（即插即用）
  * <p>
- * 当从 AIS !AIVDO 中识别到合法的本船 MMSI 后，自动向目标船库刷入 serialdata-schema.sql 表结构
+ * 当从 AIS !AIVDO 中识别到合法的本船 MMSI 后，自动向目标分船库刷入 schema/ship-schema.sql 时序表结构
  */
 @Slf4j
 @Service
@@ -62,11 +62,7 @@ public class ShipAutoRegisterService {
         try {
             ClassPathResource resource = new ClassPathResource("schema/ship-schema.sql");
             if (!resource.exists()) {
-                resource = new ClassPathResource("schema/serialdata-schema.sql");
-            }
-            if (!resource.exists()) {
-                log.warn("[AutoRegister] 未找到 schema/ship-schema.sql，跳过表结构初始化");
-                return;
+                throw new IllegalStateException("缺少 schema/ship-schema.sql，无法初始化船舶独立时序库结构");
             }
             String sql = new String(resource.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
             String cleaned = sql.replaceAll("(?m)^--.*$", "");

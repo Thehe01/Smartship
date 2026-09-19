@@ -106,13 +106,17 @@ smartship-edge-core/
 │   │   └── resources/
 │   │       ├── application.yml               # 脱敏配置文件
 │   │       └── schema/
-│   │           └── serialdata-schema.sql     # 船舶表结构自动初始化 DDL
+│   │           ├── auth-schema.sql           # 主认证库 ship_database_registry 元数据表
+│   │           └── ship-schema.sql           # 分船业务时序表及本地游标断点表
 │   └── test/
 │       └── java/com/smartship/edge/          # 自动化核心单元测试
 │           ├── AisPayloadDecoderTest.java    # AIS 6-bit 算法测试
+│           ├── ModbusTcpCodecTest.java       # Modbus TCP MBAP 编解码与半包粘包重组测试
 │           ├── NmeaChecksumTest.java         # NMEA 校验与经纬度转换测试
 │           ├── PersistenceThrottleTest.java  # 无锁 CAS 50线程并发压测
-│           └── MqttStableIdTest.java         # SHA-256 幂等散列稳定性测试
+│           ├── ShipSchemaIsolationTest.java  # 分船库与主库表结构彻底物理隔离测试
+│           ├── StaticMmsiInitTest.java       # 静态 MMSI 启动自注册生命周期测试
+│           └── MqttStableIdTest.java         # SHA-256 幂等散列确定性测试
 ```
 
 ---
