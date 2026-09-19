@@ -23,6 +23,14 @@
         <jserialcomm.version>2.10.4</jserialcomm.version>
         <paho.mqtt.version>1.2.5</paho.mqtt.version>
         <lombok.version>1.18.34</lombok.version>
+        <!-- P1-4 benchmark 可配置参数（均有保守默认值，CLI -D 可覆盖） -->
+        <benchmark.durationSeconds>5</benchmark.durationSeconds>
+        <benchmark.messages>3000</benchmark.messages>
+        <benchmark.threads>32</benchmark.threads>
+        <benchmark.persistence.tasks>200,800</benchmark.persistence.tasks>
+        <benchmark.persistence.latencyMs>5,25</benchmark.persistence.latencyMs>
+        <benchmark.ships>1,10,50</benchmark.ships>
+        <benchmark.mqtt.rows>10000</benchmark.mqtt.rows>
     </properties>
 
     <dependencies>
@@ -113,6 +121,10 @@
                          否则分叉测试 JVM 报 "Can not attach to current VM"；
                          无 JaCoCo 等其他 argLine 消费者，直接声明即可 -->
                     <argLine>-Djdk.attach.allowAttachSelf=true</argLine>
+                    <!-- P1-4: *BenchmarkTest 默认不随普通测试执行 -->
+                    <excludes>
+                        <exclude>**/*BenchmarkTest.java</exclude>
+                    </excludes>
                 </configuration>
             </plugin>
             <plugin>
@@ -124,4 +136,35 @@
             </plugin>
         </plugins>
     </build>
+
+    <!-- P1-4: mvn test -Pbenchmark 仅运行 *BenchmarkTest，结果落盘 target/benchmark -->
+    <profiles>
+        <profile>
+            <id>benchmark</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <argLine>-Djdk.attach.allowAttachSelf=true</argLine>
+                            <excludes combine.self="override" />
+                            <includes>
+                                <include>**/*BenchmarkTest.java</include>
+                            </includes>
+                            <systemPropertyVariables>
+                                <benchmark.durationSeconds>${benchmark.durationSeconds}</benchmark.durationSeconds>
+                                <benchmark.messages>${benchmark.messages}</benchmark.messages>
+                                <benchmark.threads>${benchmark.threads}</benchmark.threads>
+                                <benchmark.persistence.tasks>${benchmark.persistence.tasks}</benchmark.persistence.tasks>
+                                <benchmark.persistence.latencyMs>${benchmark.persistence.latencyMs}</benchmark.persistence.latencyMs>
+                                <benchmark.ships>${benchmark.ships}</benchmark.ships>
+                                <benchmark.mqtt.rows>${benchmark.mqtt.rows}</benchmark.mqtt.rows>
+                            </systemPropertyVariables>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>
