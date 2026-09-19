@@ -37,3 +37,8 @@ Thumbs.db
 *.log
 logs/
 run/
+
+### Local Private Docs ###
+docs/
+.mmsi_cache
+

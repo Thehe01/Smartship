@@ -81,8 +81,6 @@ flowchart TD
 smartship-edge-core/
 ├── pom.xml                                   # 纯净 Maven 依赖 (Spring Boot 3.3.5, Java 17/21)
 ├── README.md                                 # 本项目技术说明
-├── docs/
-│   └── smartship_interview_guide.md          # 详细的设计技术与面试全景答辩手册
 ├── src/
 │   ├── main/
 │   │   ├── java/com/smartship/edge/
@@ -141,13 +139,6 @@ mvn clean test
 ```bash
 mvn spring-boot:run
 ```
-
----
-
-## 📖 技术演进与设计白皮书
-
-关于本工程的**架构权衡、与业界标准 Transactional Outbox 的客观差异、线上 jstack 故障排查手册、以及求职答辩高频问答**，请参阅：
-👉 [docs/smartship_interview_guide.md](docs/smartship_interview_guide.md)
 
 ---
 
