@@ -58,6 +58,7 @@ smartship:
         default-password: "123456"
         maximum-pool-size: 5         # 边缘工控机配额约束
         jdbc-params: "useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false"
+        registry-validation-interval-ms: 5000 # 动态分船注册信息轻量 TTL 校验周期（毫秒）
 
     # [模块四] MQTT 上报链路配置
     uploader:

@@ -16,6 +16,7 @@ import org.springframework.util.StringUtils;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HexFormat;
@@ -25,16 +26,16 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * 分船数据库动态路由与连接池生命周期管理器 (P1-2 Dynamic HikariCP Lifecycle Governance)
+ * 分船数据库动态路由与连接池生命周期管理器 (P1-2 / P1-2.5 Dynamic HikariCP Lifecycle & Revalidation Hardening)
  * <p>
  * 核心架构特性：
  * 1. 库级数据隔离（Schema-Level Isolation）：以 MMSI 为缓存 Key 动态路由至每艘船专属的 HikariDataSource 连接池
  * 2. 完备生命周期治理：保留真实 HikariDataSource 实例，支持显式刷新、驱逐与优雅停机销毁
- * 3. 确定性配置指纹（Config Fingerprint）：基于配置计算 SHA-256 摘要，动态比对以决定是否触发重建，不打印明文密码
+ * 3. 确定性配置指纹（Config Fingerprint）：基于生效配置计算 SHA-256 摘要，动态比对以决定是否触发重建，不打印明文密码
  * 4. 故障安全（Fail-Safe）切换：严格遵循 create new pool -> replace context -> close old pool 拓扑序，新池失败时原池不受损
- * 5. 并发安全保证：多线程并发首次访问同一 MMSI 时基于细粒度锁保证有且仅有单个连接池存活，避免资源泄漏
- * 6. 快路径无锁读取：高频 getJdbcTemplate 路径 lock-free，低频配置变更操作轻量同步
- * 7. 严格准入与驱逐：未注册或已被禁用（enabled=0）船舶坚决拦截并主动驱逐已有连接池
+ * 5. 并发安全保证：多线程并发首次访问或并发触发过期再校验时基于细粒度锁保证有且仅有单个连接池存活，避免资源泄漏
+ * 6. 快路径无锁读取与轻量 TTL：未过期访问 lock-free 直接返回，TTL 到期触发二次检查再校验
+ * 7. 严格准入与自动驱逐：未注册或已被禁用（enabled=0）船舶坚决拦截并主动驱逐已有连接池
  */
 @Slf4j
 @Component
@@ -43,6 +44,11 @@ public class ShipDataSourceManager {
 
     private final JdbcTemplate authJdbcTemplate;
     private final EdgeProperties properties;
+
+    /**
+     * 可注入的时间源，用于 TTL 校验与单元测试确定性时间模拟 (默认系统时钟)
+     */
+    private Clock clock = Clock.systemUTC();
 
     /**
      * 以 MMSI 为主键维护的分船动态数据源上下文缓存
@@ -64,6 +70,22 @@ public class ShipDataSourceManager {
      */
     private volatile boolean destroyed = false;
 
+    public void setClock(Clock clock) {
+        this.clock = clock != null ? clock : Clock.systemUTC();
+    }
+
+    protected long currentTimeMillis() {
+        return clock.millis();
+    }
+
+    private long getValidationIntervalMs() {
+        if (properties == null || properties.getDatasource() == null
+                || properties.getDatasource().getShip() == null) {
+            return 5000L;
+        }
+        return Math.max(0L, properties.getDatasource().getShip().getRegistryValidationIntervalMs());
+    }
+
     private void checkNotDestroyed() {
         if (this.destroyed) {
             throw new IllegalStateException("[ShipDB] ShipDataSourceManager 已经关闭/销毁");
@@ -71,7 +93,7 @@ public class ShipDataSourceManager {
     }
 
     /**
-     * 获取指定船舶对应的 JdbcTemplate（高频快路径无锁，低频未命中走线程安全初始化）
+     * 获取指定船舶对应的 JdbcTemplate（高频快路径无锁，低频未命中/TTL过期走受控校验与初始化）
      *
      * @param shipId 船舶业务 ID（可选）
      * @param mmsi   船舶 MMSI（可选，但与 shipId 不能同时为空）
@@ -85,17 +107,19 @@ public class ShipDataSourceManager {
         }
         checkNotDestroyed();
 
-        // 快路径（Fast Path）：完全无锁，以规范化 MMSI 检索 ConcurrentHashMap
+        // 快路径（Fast Path）：完全无锁，以规范化 MMSI 检索 ConcurrentHashMap 并校验 TTL
         String knownMmsi = cleanMmsi != null ? cleanMmsi : shipIdToMmsi.get(cleanShipId);
         if (knownMmsi != null) {
             ShipDataSourceContext context = contexts.get(knownMmsi);
-            if (context != null && !context.isClosed()) {
+            long now = currentTimeMillis();
+            long interval = getValidationIntervalMs();
+            if (context != null && !context.isClosed() && (now - context.getLastValidatedAt() < interval)) {
                 return context.getJdbcTemplate();
             }
         }
 
-        // 慢路径（Slow Path）：首次加载或连接池已失效，进入同步初始化流程
-        return getOrCreateContext(cleanShipId, cleanMmsi).getJdbcTemplate();
+        // 慢路径（Slow Path）：首次加载、连接池失效或 TTL 到期，进入受控校验与初始化流程
+        return getOrRevalidateContext(cleanShipId, cleanMmsi).getJdbcTemplate();
     }
 
     /**
@@ -106,75 +130,44 @@ public class ShipDataSourceManager {
     }
 
     /**
-     * 线程安全获取或创建数据源上下文实体
+     * 线程安全获取或重新校验数据源上下文实体 (慢路径)
      */
-    private ShipDataSourceContext getOrCreateContext(String shipId, String mmsi) {
+    private ShipDataSourceContext getOrRevalidateContext(String shipId, String mmsi) {
         checkNotDestroyed();
-        String knownMmsi = mmsi != null ? mmsi : (shipId != null ? shipIdToMmsi.get(shipId) : null);
-        if (knownMmsi != null) {
-            ShipDataSourceContext existing = contexts.get(knownMmsi);
-            if (existing != null && !existing.isClosed()) {
-                return existing;
-            }
-        }
-
-        String targetMmsi = knownMmsi;
-        ShipDatabase registry = null;
+        String targetMmsi = mmsi != null ? mmsi : (shipId != null ? shipIdToMmsi.get(shipId) : null);
+        ShipDatabase initialRegistry = null;
         if (targetMmsi == null) {
-            registry = resolveRegistry(shipId, mmsi);
-            if (registry == null || !registry.enabled()) {
+            initialRegistry = resolveRegistry(shipId, mmsi);
+            if (initialRegistry == null) {
                 throw new IllegalStateException("[ShipDB] 船舶未在注册表中配置或已被禁用: shipId=" + shipId + ", mmsi=" + mmsi);
             }
-            targetMmsi = registry.mmsi();
+            if (!initialRegistry.enabled()) {
+                throw new IllegalStateException("[ShipDB] 船舶未在注册表中配置或已被禁用: shipId=" + shipId + ", mmsi=" + initialRegistry.mmsi());
+            }
+            targetMmsi = initialRegistry.mmsi();
         }
 
         Object lock = locks.computeIfAbsent(targetMmsi, k -> new Object());
         synchronized (lock) {
             checkNotDestroyed();
-            ShipDataSourceContext existing = contexts.get(targetMmsi);
-            if (existing != null && !existing.isClosed()) {
-                if (registry != null && StringUtils.hasText(registry.shipId())) {
-                    shipIdToMmsi.put(registry.shipId(), targetMmsi);
+            ShipDataSourceContext current = contexts.get(targetMmsi);
+            long now = currentTimeMillis();
+            long interval = getValidationIntervalMs();
+
+            // Double check TTL: 若其他并发线程在排队等待锁期间已经完成了再校验或刷新，直接复用
+            if (current != null && !current.isClosed() && (now - current.getLastValidatedAt() < interval)) {
+                if (initialRegistry != null && StringUtils.hasText(initialRegistry.shipId())) {
+                    shipIdToMmsi.put(initialRegistry.shipId(), targetMmsi);
                 }
-                return existing;
+                return current;
             }
 
-            if (registry == null) {
-                registry = resolveRegistry(shipId, targetMmsi);
-                if (registry == null || !registry.enabled()) {
-                    throw new IllegalStateException("[ShipDB] 船舶未在注册表中配置或已被禁用: shipId=" + shipId + ", mmsi=" + targetMmsi);
-                }
-            }
-
-            String canonicalMmsi = registry.mmsi();
-            String fingerprint = computeFingerprint(registry);
-            HikariDataSource ds = createDataSource(registry);
-            JdbcTemplate jt = new JdbcTemplate(ds);
-            ShipDataSourceContext newCtx = new ShipDataSourceContext(
-                    registry, ds, jt, fingerprint, System.currentTimeMillis()
-            );
-
-            if (this.destroyed) {
-                newCtx.close();
-                throw new IllegalStateException("[ShipDB] ShipDataSourceManager 已经关闭/销毁，拒绝创建新连接池");
-            }
-
-            contexts.put(canonicalMmsi, newCtx);
-            if (StringUtils.hasText(registry.shipId())) {
-                shipIdToMmsi.put(registry.shipId(), canonicalMmsi);
-            }
-            return newCtx;
+            return revalidateOrRefreshContext(targetMmsi, shipId, current, initialRegistry, false);
         }
     }
 
     /**
      * 显式刷新指定船舶的数据源配置
-     * <p>
-     * 核心逻辑：
-     * 1. 检查注册信息，若不存在或已被禁用，主动驱逐并关闭已有连接池
-     * 2. 计算新指纹，若指纹未变且连接池活跃，跳过并复用现有连接池
-     * 3. 若配置发生变化，严格遵循：create new pool -> replace context -> close old pool
-     * 4. 若创建新 pool 失败，抛出异常并保证原有旧 pool 完好不受损
      *
      * @param mmsi 船舶 MMSI
      * @return true 表示成功刷新并切换为新连接池；false 表示指纹未变复用原池或已被驱逐
@@ -189,68 +182,106 @@ public class ShipDataSourceManager {
         Object lock = locks.computeIfAbsent(cleanMmsi, k -> new Object());
         synchronized (lock) {
             checkNotDestroyed();
-            ShipDatabase registry = resolveRegistry(null, cleanMmsi);
-            if (registry == null) {
-                log.warn("[ShipDB] 船舶在注册表中不存在，执行驱逐: mmsi={}", cleanMmsi);
-                invalidateDataSource(cleanMmsi);
-                return false;
+            ShipDataSourceContext current = contexts.get(cleanMmsi);
+            ShipDataSourceContext result = revalidateOrRefreshContext(cleanMmsi, null, current, null, true);
+            return result != null && result != current;
+        }
+    }
+
+    /**
+     * 统一的连接池再校验与刷新逻辑 (统一供 getJdbcTemplate 慢路径与 refreshDataSource 复用)
+     *
+     * @param targetMmsi           目标 MMSI
+     * @param shipId               船舶 ID (可选)
+     * @param current              当前缓存的 Context (可能为 null)
+     * @param preResolvedRegistry 预先查询出的 registry (可选)
+     * @param forceRefresh         是否为显式强制刷新
+     * @return 刷新后的有效 Context；若显式刷新中发现被禁用或不存在则返回 null
+     */
+    private ShipDataSourceContext revalidateOrRefreshContext(
+            String targetMmsi,
+            String shipId,
+            ShipDataSourceContext current,
+            ShipDatabase preResolvedRegistry,
+            boolean forceRefresh) {
+
+        ShipDatabase registry = preResolvedRegistry;
+        if (registry == null) {
+            // 注意：若主认证库故障，resolveRegistry 会抛出 RegistryQueryException，异常向上传播，保留原连接池，不触发驱逐
+            registry = resolveRegistry(shipId, targetMmsi);
+        }
+
+        if (registry == null) {
+            log.warn("[ShipDB] 船舶在注册表中不存在，执行驱逐: mmsi={}", targetMmsi);
+            doInvalidate(targetMmsi);
+            if (forceRefresh) {
+                return null;
             }
+            throw new IllegalStateException("[ShipDB] 船舶未在注册表中配置或已被禁用: shipId=" + shipId + ", mmsi=" + targetMmsi);
+        }
 
-            if (!registry.enabled()) {
-                log.warn("[ShipDB] 船舶已被禁用 (enabled=false)，主动驱逐并关闭已有连接池: mmsi={}", cleanMmsi);
-                invalidateDataSource(cleanMmsi);
-                return false;
+        if (!registry.enabled()) {
+            log.warn("[ShipDB] 船舶已被禁用 (enabled=false)，主动驱逐并关闭已有连接池: mmsi={}", targetMmsi);
+            doInvalidate(targetMmsi);
+            if (forceRefresh) {
+                return null;
             }
+            throw new IllegalStateException("[ShipDB] 船舶未在注册表中配置或已被禁用: shipId=" + shipId + ", mmsi=" + targetMmsi);
+        }
 
-            String canonicalMmsi = registry.mmsi();
-            String newFingerprint = computeFingerprint(registry);
-            ShipDataSourceContext currentContext = contexts.get(canonicalMmsi);
+        String canonicalMmsi = registry.mmsi();
+        String newFingerprint = computeFingerprint(registry);
+        long now = currentTimeMillis();
 
-            // 指纹未变且原池仍存活时，直接复用
-            if (currentContext != null && !currentContext.isClosed()
-                    && Objects.equals(newFingerprint, currentContext.getConfigFingerprint())) {
-                log.info("[ShipDB] 船舶 MMSI: {} 配置指纹未发生变化 ({})，复用现有连接池", canonicalMmsi, newFingerprint);
-                return false;
-            }
-
-            log.info("[ShipDB] 船舶 MMSI: {} 配置指纹发生变化或连接池未激活，开始重建连接池...", canonicalMmsi);
-
-            // 1. 创建新连接池（若此处抛出异常，旧 pool 不会被关闭，上下文不会被污染）
-            HikariDataSource newDataSource = createDataSource(registry);
-            JdbcTemplate newJdbcTemplate = new JdbcTemplate(newDataSource);
-            ShipDataSourceContext newContext = new ShipDataSourceContext(
-                    registry,
-                    newDataSource,
-                    newJdbcTemplate,
-                    newFingerprint,
-                    System.currentTimeMillis()
-            );
-
-            if (this.destroyed) {
-                newContext.close();
-                throw new IllegalStateException("[ShipDB] ShipDataSourceManager 已经关闭/销毁，拒绝刷新连接池");
-            }
-
-            // 2. 替换上下文
-            ShipDataSourceContext oldContext = contexts.put(canonicalMmsi, newContext);
+        // 指纹未变且当前连接池依然存活时，更新 lastValidatedAt 并复用现有连接池
+        if (current != null && !current.isClosed()
+                && Objects.equals(newFingerprint, current.getConfigFingerprint())) {
+            log.info("[ShipDB] 船舶 MMSI: {} 配置指纹未发生变化 ({})，复用现有连接池", canonicalMmsi, newFingerprint);
+            current.markValidated(now);
             if (StringUtils.hasText(registry.shipId())) {
                 shipIdToMmsi.put(registry.shipId(), canonicalMmsi);
             }
-            // 若旧上下文登记过不同的 shipId，清理旧 shipId 映射
-            if (oldContext != null && oldContext.getRegistry() != null
-                    && StringUtils.hasText(oldContext.getRegistry().shipId())
-                    && !oldContext.getRegistry().shipId().equals(registry.shipId())) {
-                shipIdToMmsi.remove(oldContext.getRegistry().shipId());
-            }
-
-            // 3. 安全关闭旧连接池
-            if (oldContext != null) {
-                log.info("[ShipDB] 船舶 MMSI: {} 新连接池挂载完毕，开始安全关闭旧连接池", canonicalMmsi);
-                oldContext.close();
-            }
-
-            return true;
+            return current;
         }
+
+        log.info("[ShipDB] 船舶 MMSI: {} 配置指纹发生变化或连接池未激活，开始重建连接池...", canonicalMmsi);
+
+        // 1. 创建新连接池（若此处抛出异常，旧 pool 不会被关闭，上下文不会被污染）
+        HikariDataSource newDataSource = createDataSource(registry);
+        JdbcTemplate newJdbcTemplate = new JdbcTemplate(newDataSource);
+        ShipDataSourceContext newContext = new ShipDataSourceContext(
+                registry,
+                newDataSource,
+                newJdbcTemplate,
+                newFingerprint,
+                now,
+                now
+        );
+
+        if (this.destroyed) {
+            newContext.close();
+            throw new IllegalStateException("[ShipDB] ShipDataSourceManager 已经关闭/销毁，拒绝创建/刷新连接池");
+        }
+
+        // 2. 替换上下文
+        ShipDataSourceContext oldContext = contexts.put(canonicalMmsi, newContext);
+        if (StringUtils.hasText(registry.shipId())) {
+            shipIdToMmsi.put(registry.shipId(), canonicalMmsi);
+        }
+        // 若旧上下文登记过不同的 shipId，清理旧 shipId 映射
+        if (oldContext != null && oldContext.getRegistry() != null
+                && StringUtils.hasText(oldContext.getRegistry().shipId())
+                && !oldContext.getRegistry().shipId().equals(registry.shipId())) {
+            shipIdToMmsi.remove(oldContext.getRegistry().shipId());
+        }
+
+        // 3. 安全关闭旧连接池
+        if (oldContext != null) {
+            log.info("[ShipDB] 船舶 MMSI: {} 新连接池挂载完毕，开始安全关闭旧连接池", canonicalMmsi);
+            oldContext.close();
+        }
+
+        return newContext;
     }
 
     /**
@@ -267,16 +298,20 @@ public class ShipDataSourceManager {
 
         Object lock = locks.computeIfAbsent(cleanMmsi, k -> new Object());
         synchronized (lock) {
-            ShipDataSourceContext context = contexts.remove(cleanMmsi);
-            // 清理所有指向该 mmsi 的反向索引映射
-            shipIdToMmsi.values().removeIf(m -> m.equals(cleanMmsi));
-            if (context != null) {
-                context.close();
-                log.info("[ShipDB] 成功驱逐并关闭船舶 MMSI: {} 的连接池", cleanMmsi);
-                return true;
-            }
-            return false;
+            return doInvalidate(cleanMmsi);
         }
+    }
+
+    private boolean doInvalidate(String cleanMmsi) {
+        ShipDataSourceContext context = contexts.remove(cleanMmsi);
+        // 清理所有指向该 mmsi 的反向索引映射
+        shipIdToMmsi.values().removeIf(m -> m.equals(cleanMmsi));
+        if (context != null) {
+            context.close();
+            log.info("[ShipDB] 成功驱逐并关闭船舶 MMSI: {} 的连接池", cleanMmsi);
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -350,22 +385,36 @@ public class ShipDataSourceManager {
     /**
      * 计算数据源配置的 SHA-256 确定性指纹
      * <p>
-     * 严格覆盖：host, port, databaseName, username, password, maximumPoolSize, jdbcParams
+     * 严格覆盖实际生效配置：buildJdbcUrl(registry), username, password 原值 (不 trim), driverClassName, maximumPoolSize, jdbcParams
      * 采用 SHA-256 哈希，杜绝明文打印密码。
      */
     public String computeFingerprint(ShipDatabase registry) {
         if (registry == null) {
             return "";
         }
+        String jdbcUrl = buildJdbcUrl(registry);
+        String customDriver = properties.getDatasource().getShip().getDriverClassName();
+        String driverClassName;
+        if (StringUtils.hasText(customDriver)) {
+            driverClassName = customDriver.trim();
+        } else if (jdbcUrl.startsWith("jdbc:h2:")) {
+            driverClassName = "org.h2.Driver";
+        } else {
+            driverClassName = "com.mysql.cj.jdbc.Driver";
+        }
+
         int maxPoolSize = Math.max(1, properties.getDatasource().getShip().getMaximumPoolSize());
         String jdbcParams = firstText(properties.getDatasource().getShip().getJdbcParams());
-        String canonical = "host=" + (registry.host() == null ? "" : registry.host().trim())
-                + "|port=" + registry.port()
+        String rawUsername = registry.username() == null ? "" : registry.username();
+        String rawPassword = registry.password() == null ? "" : registry.password();
+
+        String canonical = "url=" + jdbcUrl
                 + "|db=" + (registry.databaseName() == null ? "" : registry.databaseName().trim())
-                + "|user=" + (registry.username() == null ? "" : registry.username().trim())
-                + "|pwd=" + (registry.password() == null ? "" : registry.password().trim())
+                + "|user=" + rawUsername
+                + "|pwd=" + rawPassword
+                + "|driver=" + driverClassName
                 + "|maxPool=" + maxPoolSize
-                + "|params=" + jdbcParams.trim();
+                + "|params=" + jdbcParams;
         try {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
                     .digest(canonical.getBytes(StandardCharsets.UTF_8)));
@@ -459,7 +508,7 @@ public class ShipDataSourceManager {
 
         String customDriver = properties.getDatasource().getShip().getDriverClassName();
         if (StringUtils.hasText(customDriver)) {
-            config.setDriverClassName(customDriver);
+            config.setDriverClassName(customDriver.trim());
         } else if (jdbcUrl.startsWith("jdbc:h2:")) {
             config.setDriverClassName("org.h2.Driver");
         } else {
@@ -469,9 +518,11 @@ public class ShipDataSourceManager {
         config.setMaximumPoolSize(Math.max(1, properties.getDatasource().getShip().getMaximumPoolSize()));
         config.setMinimumIdle(1);
         config.setConnectionTimeout(3000);
+
+        HikariDataSource ds = new HikariDataSource(config);
         log.info("[ShipDB] 为船舶 MMSI: {} 成功构建独立连接池: {}, poolName: {}",
                 registry.mmsi(), registry.databaseName(), config.getPoolName());
-        return new HikariDataSource(config);
+        return ds;
     }
 
     /**

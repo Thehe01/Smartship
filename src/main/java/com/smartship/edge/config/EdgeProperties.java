@@ -83,6 +83,7 @@ public class EdgeProperties {
         private int maximumPoolSize = 5;
         private String jdbcParams = "useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false";
         private String driverClassName = "";
+        private long registryValidationIntervalMs = 5000L;
     }
 
     @Data

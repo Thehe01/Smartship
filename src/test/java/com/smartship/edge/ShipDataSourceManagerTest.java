@@ -17,6 +17,9 @@ import java.sql.Connection;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -600,5 +603,262 @@ class ShipDataSourceManagerTest {
 
         // 此时旧 shipId 如果在数据库中已无记录，调用将抛出 IllegalStateException（因为旧索引已清理）
         assertThrows(IllegalStateException.class, () -> manager.getJdbcTemplate("ship-old", null));
+    }
+
+    @Test
+    @DisplayName("测试场景 17 (P1-2.5): cached datasource is evicted after registry disabled without explicit refresh")
+    void testCachedDatasourceIsEvictedAfterRegistryDisabledWithoutExplicitRefresh() {
+        String mmsi = "413999999";
+        String h2Url = "jdbc:h2:mem:ship_ttl_dis_" + mmsi + ";DB_CLOSE_DELAY=-1;MODE=MySQL";
+        insertShip("ship-1", mmsi, "zncb_ship_1", h2Url, 0, "sa", "", true);
+
+        manager.setClock(Clock.fixed(Instant.ofEpochMilli(1_000_000L), ZoneOffset.UTC));
+        JdbcTemplate jt = manager.getJdbcTemplate(null, mmsi);
+        assertNotNull(jt);
+        ShipDataSourceContext ctx = manager.getDataSourceContext(mmsi);
+        HikariDataSource ds = ctx.getDataSource();
+        assertFalse(ds.isClosed());
+
+        // 在注册库将船舶禁用
+        authJdbcTemplate.update("UPDATE ship_database_registry SET enabled = 0 WHERE mmsi = ?", mmsi);
+
+        // 未过 TTL 时依然命中快路径
+        JdbcTemplate jtFast = manager.getJdbcTemplate(null, mmsi);
+        assertSame(jt, jtFast);
+
+        // 时间推进 6000ms (超过默认 5000ms TTL)
+        manager.setClock(Clock.fixed(Instant.ofEpochMilli(1_000_000L + 6000L), ZoneOffset.UTC));
+
+        // 再次访问，无需显式调用 refreshDataSource，应在再校验中发现 disabled 并主动驱逐
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () -> manager.getJdbcTemplate(null, mmsi));
+        assertTrue(ex.getMessage().contains("未在注册表中配置或已被禁用"));
+        assertNull(manager.getDataSourceContext(mmsi), "禁用船舶必须从缓存中被驱逐");
+        assertTrue(ds.isClosed(), "旧连接池必须已被关闭");
+    }
+
+    @Test
+    @DisplayName("测试场景 18 (P1-2.5): cached datasource rejects access after registry row removed")
+    void testCachedDatasourceRejectsAccessAfterRegistryRowRemoved() {
+        String mmsi = "413999999";
+        String h2Url = "jdbc:h2:mem:ship_ttl_del_" + mmsi + ";DB_CLOSE_DELAY=-1;MODE=MySQL";
+        insertShip("ship-1", mmsi, "zncb_ship_1", h2Url, 0, "sa", "", true);
+
+        manager.setClock(Clock.fixed(Instant.ofEpochMilli(1_000_000L), ZoneOffset.UTC));
+        manager.getJdbcTemplate(null, mmsi);
+        ShipDataSourceContext ctx = manager.getDataSourceContext(mmsi);
+        HikariDataSource ds = ctx.getDataSource();
+        assertFalse(ds.isClosed());
+
+        // 从注册库物理删除该船舶记录
+        authJdbcTemplate.update("DELETE FROM ship_database_registry WHERE mmsi = ?", mmsi);
+
+        // 时间推进 6000ms 超过 TTL
+        manager.setClock(Clock.fixed(Instant.ofEpochMilli(1_000_000L + 6000L), ZoneOffset.UTC));
+
+        // 再次访问，应自动感知记录不存在并驱逐
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () -> manager.getJdbcTemplate(null, mmsi));
+        assertTrue(ex.getMessage().contains("未在注册表中配置或已被禁用"));
+        assertNull(manager.getDataSourceContext(mmsi), "已删除船舶必须从缓存中被驱逐");
+        assertTrue(ds.isClosed(), "旧连接池必须已被关闭");
+    }
+
+    @Test
+    @DisplayName("测试场景 19 (P1-2.5): cached datasource auto-refreshes after config change without explicit refresh")
+    void testCachedDatasourceAutoRefreshesAfterConfigChangeWithoutExplicitRefresh() {
+        String mmsi = "413999999";
+        String h2Url1 = "jdbc:h2:mem:ship_ttl_cfg1_" + mmsi + ";DB_CLOSE_DELAY=-1;MODE=MySQL";
+        insertShip("ship-1", mmsi, "zncb_ship_1", h2Url1, 0, "sa", "", true);
+
+        manager.setClock(Clock.fixed(Instant.ofEpochMilli(1_000_000L), ZoneOffset.UTC));
+        JdbcTemplate jt1 = manager.getJdbcTemplate(null, mmsi);
+        ShipDataSourceContext ctx1 = manager.getDataSourceContext(mmsi);
+        HikariDataSource ds1 = ctx1.getDataSource();
+
+        // 注册库修改配置 (新 host URL)
+        String h2Url2 = "jdbc:h2:mem:ship_ttl_cfg2_" + mmsi + ";DB_CLOSE_DELAY=-1;MODE=MySQL";
+        authJdbcTemplate.update("UPDATE ship_database_registry SET host = ? WHERE mmsi = ?", h2Url2, mmsi);
+
+        // 时间推进 6000ms 超过 TTL
+        manager.setClock(Clock.fixed(Instant.ofEpochMilli(1_000_000L + 6000L), ZoneOffset.UTC));
+
+        // 访问触发自动再校验与热替换
+        JdbcTemplate jt2 = manager.getJdbcTemplate(null, mmsi);
+        ShipDataSourceContext ctx2 = manager.getDataSourceContext(mmsi);
+        HikariDataSource ds2 = ctx2.getDataSource();
+
+        assertNotSame(jt1, jt2, "配置变更后应返回新 JdbcTemplate");
+        assertNotSame(ctx1, ctx2, "必须生成新上下文");
+        assertNotSame(ds1, ds2, "必须生成新连接池");
+        assertTrue(ds1.isClosed(), "旧连接池必须已被关闭");
+        assertFalse(ds2.isClosed(), "新连接池必须处于活跃状态");
+
+        // 验证新连接池执行正常
+        Integer val = jt2.queryForObject("SELECT 1", Integer.class);
+        assertEquals(1, val);
+    }
+
+    @Test
+    @DisplayName("测试场景 20 (P1-2.5): registry query failure during revalidation keeps old pool intact")
+    void testRegistryQueryFailureDuringRevalidationKeepsOldPoolIntact() {
+        String mmsi = "413999999";
+        String h2Url = "jdbc:h2:mem:ship_ttl_fail_" + mmsi + ";DB_CLOSE_DELAY=-1;MODE=MySQL";
+        insertShip("ship-1", mmsi, "zncb_ship_1", h2Url, 0, "sa", "", true);
+
+        manager.setClock(Clock.fixed(Instant.ofEpochMilli(1_000_000L), ZoneOffset.UTC));
+        manager.getJdbcTemplate(null, mmsi);
+        ShipDataSourceContext ctx1 = manager.getDataSourceContext(mmsi);
+        HikariDataSource ds1 = ctx1.getDataSource();
+        assertFalse(ds1.isClosed());
+
+        // 破坏注册表模拟认证库异常
+        authJdbcTemplate.execute("DROP TABLE ship_database_registry");
+
+        // 时间推进 6000ms 超过 TTL
+        manager.setClock(Clock.fixed(Instant.ofEpochMilli(1_000_000L + 6000L), ZoneOffset.UTC));
+
+        // 触发再校验时遇到 RegistryQueryException，必须向上抛出且保留原连接池
+        assertThrows(RegistryQueryException.class, () -> manager.getJdbcTemplate(null, mmsi));
+
+        // 验证原连接池完好无损
+        ShipDataSourceContext ctxAfter = manager.getDataSourceContext(mmsi);
+        assertSame(ctx1, ctxAfter, "认证库异常时绝不能误删原本健康的连接池上下文");
+        assertFalse(ds1.isClosed(), "原有连接池依然存活");
+    }
+
+    @Test
+    @DisplayName("测试场景 21 (P1-2.5): unchanged fingerprint only updates lastValidatedAt and reuses old pool")
+    void testUnchangedFingerprintOnlyUpdatesLastValidatedAtAndReusesOldPool() {
+        String mmsi = "413999999";
+        String h2Url = "jdbc:h2:mem:ship_ttl_same_" + mmsi + ";DB_CLOSE_DELAY=-1;MODE=MySQL";
+        insertShip("ship-1", mmsi, "zncb_ship_1", h2Url, 0, "sa", "", true);
+
+        long t0 = 1_000_000L;
+        manager.setClock(Clock.fixed(Instant.ofEpochMilli(t0), ZoneOffset.UTC));
+        JdbcTemplate jt1 = manager.getJdbcTemplate(null, mmsi);
+        ShipDataSourceContext ctx1 = manager.getDataSourceContext(mmsi);
+        HikariDataSource ds1 = ctx1.getDataSource();
+        assertEquals(t0, ctx1.getLastValidatedAt());
+
+        // 时间推进 8000ms (超过 5000ms)
+        long t1 = t0 + 8000L;
+        manager.setClock(Clock.fixed(Instant.ofEpochMilli(t1), ZoneOffset.UTC));
+
+        // 触发再校验，由于配置完全一致，仅更新 lastValidatedAt 并复用旧池
+        JdbcTemplate jt2 = manager.getJdbcTemplate(null, mmsi);
+        ShipDataSourceContext ctx2 = manager.getDataSourceContext(mmsi);
+        assertSame(jt1, jt2);
+        assertSame(ctx1, ctx2);
+        assertSame(ds1, ctx2.getDataSource());
+        assertFalse(ds1.isClosed());
+        assertEquals(t1, ctx2.getLastValidatedAt(), "校验时间戳必须更新为当前时间");
+    }
+
+    @Test
+    @DisplayName("测试场景 22 (P1-2.5): concurrent expired-cache access performs only one effective refresh")
+    void testConcurrentExpiredCacheAccessPerformsOnlyOneEffectiveRefresh() throws InterruptedException {
+        String mmsi = "413999999";
+        String h2Url1 = "jdbc:h2:mem:ship_ttl_conc1_" + mmsi + ";DB_CLOSE_DELAY=-1;MODE=MySQL";
+        insertShip("ship-1", mmsi, "zncb_ship_1", h2Url1, 0, "sa", "", true);
+
+        // 初始加载连接池
+        manager.getJdbcTemplate(null, mmsi);
+        ShipDataSourceContext ctx1 = manager.getDataSourceContext(mmsi);
+        HikariDataSource ds1 = ctx1.getDataSource();
+
+        // 更新数据库配置
+        String h2Url2 = "jdbc:h2:mem:ship_ttl_conc2_" + mmsi + ";DB_CLOSE_DELAY=-1;MODE=MySQL";
+        authJdbcTemplate.update("UPDATE ship_database_registry SET host = ? WHERE mmsi = ?", h2Url2, mmsi);
+
+        // 将 TTL 设置为 0，使所有线程均感知已过期并尝试触发再校验
+        properties.getDatasource().getShip().setRegistryValidationIntervalMs(0);
+
+        int threadCount = 50;
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch finishLatch = new CountDownLatch(threadCount);
+
+        List<JdbcTemplate> results = Collections.synchronizedList(new ArrayList<>());
+        List<Throwable> errors = Collections.synchronizedList(new ArrayList<>());
+
+        for (int i = 0; i < threadCount; i++) {
+            executor.submit(() -> {
+                try {
+                    startLatch.await();
+                    JdbcTemplate jt = manager.getJdbcTemplate(null, mmsi);
+                    jt.execute("SELECT 1");
+                    results.add(jt);
+                } catch (Throwable t) {
+                    errors.add(t);
+                } finally {
+                    finishLatch.countDown();
+                }
+            });
+        }
+
+        startLatch.countDown();
+        assertTrue(finishLatch.await(10, TimeUnit.SECONDS));
+        executor.shutdown();
+
+        assertTrue(errors.isEmpty(), "50 线程并发再校验不应出现异常: " + errors);
+        assertEquals(threadCount, results.size());
+
+        // 验证所有线程拿到同一个新 JdbcTemplate
+        JdbcTemplate first = results.get(0);
+        for (JdbcTemplate jt : results) {
+            assertSame(first, jt);
+        }
+
+        // 最终全局只有 1 个存活连接池，旧连接池已被安全关闭
+        assertEquals(1, manager.listPoolSnapshots().size());
+        assertTrue(ds1.isClosed(), "旧连接池必须已被关闭");
+        assertFalse(manager.getDataSourceContext(mmsi).getDataSource().isClosed());
+    }
+
+    @Test
+    @DisplayName("测试场景 23 (P1-2.5): fingerprint distinguishes exact runtime password/config values")
+    void testFingerprintDistinguishesExactRuntimePasswordAndConfigValues() {
+        ShipDataSourceManager.ShipDatabase dbWithSpace = new ShipDataSourceManager.ShipDatabase(
+                "ship-1", "413000001", "db_1", "localhost", 3306, "root", " secret ", true
+        );
+        ShipDataSourceManager.ShipDatabase dbTrimmed = new ShipDataSourceManager.ShipDatabase(
+                "ship-1", "413000001", "db_1", "localhost", 3306, "root", "secret", true
+        );
+
+        String fp1 = manager.computeFingerprint(dbWithSpace);
+        String fp2 = manager.computeFingerprint(dbTrimmed);
+
+        assertNotNull(fp1);
+        assertNotNull(fp2);
+        assertNotEquals(fp1, fp2, "密码包含空格与未包含空格在 Hikari 运行时是不同凭据，指纹必须严格区分");
+        assertFalse(fp1.contains("secret"));
+        assertFalse(fp2.contains("secret"));
+    }
+
+    @Test
+    @DisplayName("测试场景 24 (P1-2.5): createDataSource failure does not log/swap a successful new context")
+    void testCreateDataSourceFailureDoesNotLogOrSwapNewContext() {
+        String mmsi = "413999999";
+        String h2Url = "jdbc:h2:mem:ship_bad_swap_" + mmsi + ";DB_CLOSE_DELAY=-1;MODE=MySQL";
+        insertShip("ship-1", mmsi, "zncb_ship_1", h2Url, 0, "sa", "", true);
+
+        manager.setClock(Clock.fixed(Instant.ofEpochMilli(1_000_000L), ZoneOffset.UTC));
+        manager.getJdbcTemplate(null, mmsi);
+        ShipDataSourceContext ctx1 = manager.getDataSourceContext(mmsi);
+        HikariDataSource ds1 = ctx1.getDataSource();
+
+        // 注册库配置更改为非法 JDBC 协议
+        authJdbcTemplate.update("UPDATE ship_database_registry SET host = 'jdbc:unknown_db://invalid:12345/bad' WHERE mmsi = ?", mmsi);
+
+        // 时间推进 6000ms 超过 TTL
+        manager.setClock(Clock.fixed(Instant.ofEpochMilli(1_000_000L + 6000L), ZoneOffset.UTC));
+
+        // 再校验尝试创建新连接池失败，抛出异常
+        assertThrows(Exception.class, () -> manager.getJdbcTemplate(null, mmsi));
+
+        // 验证上下文没有被替换成 null 或半损坏对象，原连接池未受破坏
+        ShipDataSourceContext ctxAfter = manager.getDataSourceContext(mmsi);
+        assertSame(ctx1, ctxAfter);
+        assertSame(ds1, ctxAfter.getDataSource());
+        assertFalse(ds1.isClosed());
     }
 }
