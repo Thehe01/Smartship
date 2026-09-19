@@ -233,14 +233,34 @@ public class ShipDataSourceManager {
         String newFingerprint = computeFingerprint(registry);
         long now = currentTimeMillis();
 
-        // 指纹未变且当前连接池依然存活时，更新 lastValidatedAt 并复用现有连接池
+        // 指纹未变且当前连接池依然存活时，复用现有物理连接池与 JdbcTemplate
         if (current != null && !current.isClosed()
                 && Objects.equals(newFingerprint, current.getConfigFingerprint())) {
             log.info("[ShipDB] 船舶 MMSI: {} 配置指纹未发生变化 ({})，复用现有连接池", canonicalMmsi, newFingerprint);
-            current.markValidated(now);
+
+            String oldShipId = current.getRegistry() != null ? current.getRegistry().shipId() : null;
+            if (StringUtils.hasText(oldShipId) && !Objects.equals(oldShipId, registry.shipId())) {
+                shipIdToMmsi.remove(oldShipId, canonicalMmsi);
+            }
             if (StringUtils.hasText(registry.shipId())) {
                 shipIdToMmsi.put(registry.shipId(), canonicalMmsi);
             }
+
+            // 若 registry 非连接元数据（如 shipId）发生变更，更新 Context 包装实体以同步元数据快照，但严格复用底层 DataSource 与 JdbcTemplate，不重建/关闭连接池
+            if (!Objects.equals(current.getRegistry(), registry)) {
+                ShipDataSourceContext updatedContext = new ShipDataSourceContext(
+                        registry,
+                        current.getDataSource(),
+                        current.getJdbcTemplate(),
+                        newFingerprint,
+                        current.getCreatedAt(),
+                        now
+                );
+                contexts.put(canonicalMmsi, updatedContext);
+                return updatedContext;
+            }
+
+            current.markValidated(now);
             return current;
         }
 

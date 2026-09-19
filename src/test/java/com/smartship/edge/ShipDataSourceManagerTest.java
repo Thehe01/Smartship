@@ -861,4 +861,54 @@ class ShipDataSourceManagerTest {
         assertSame(ds1, ctxAfter.getDataSource());
         assertFalse(ds1.isClosed());
     }
+
+    @Test
+    @DisplayName("测试场景 25 (P1-2.6): only shipId changes, fingerprint unchanged, reuses pool and syncs metadata")
+    void testOnlyShipIdChangesReusesPoolAndSyncsMetadata() {
+        String mmsi = "413999999";
+        String h2Url = "jdbc:h2:mem:ship_rename_meta_" + mmsi + ";DB_CLOSE_DELAY=-1;MODE=MySQL";
+        insertShip("ship-old", mmsi, "zncb_ship_1", h2Url, 0, "sa", "", true);
+
+        manager.setClock(Clock.fixed(Instant.ofEpochMilli(1_000_000L), ZoneOffset.UTC));
+        JdbcTemplate jt1 = manager.getJdbcTemplate("ship-old", null);
+        assertNotNull(jt1);
+        ShipDataSourceContext ctx1 = manager.getDataSourceContext(mmsi);
+        HikariDataSource ds1 = ctx1.getDataSource();
+        String fp1 = ctx1.getConfigFingerprint();
+        assertEquals("ship-old", ctx1.getRegistry().shipId());
+
+        // 仅在主库中将 ship_id 更新为 ship-new，物理连接参数（host, port, db, user, pwd, poolSize, params）完全不变
+        authJdbcTemplate.update("UPDATE ship_database_registry SET ship_id = 'ship-new' WHERE mmsi = ?", mmsi);
+
+        // 时间推进 6000ms 超过 TTL
+        manager.setClock(Clock.fixed(Instant.ofEpochMilli(1_000_000L + 6000L), ZoneOffset.UTC));
+
+        // 1. 触发再校验并使用新 shipId 访问
+        JdbcTemplate jtNew = manager.getJdbcTemplate("ship-new", null);
+        ShipDataSourceContext ctx2 = manager.getDataSourceContext(mmsi);
+
+        // 2. fingerprint 保持未变
+        assertEquals(fp1, ctx2.getConfigFingerprint(), "仅 shipId 变更时，数据库运行连接指纹保持不变");
+
+        // 3. HikariDataSource 保持同一实例未重建
+        assertSame(ds1, ctx2.getDataSource(), "指纹未变时必须严格复用同一个底层 HikariDataSource 实例");
+        assertFalse(ds1.isClosed(), "底层物理连接池绝不能被关闭");
+
+        // 4. JdbcTemplate 保持同一实例
+        assertSame(jt1, jtNew, "必须复用同一个 JdbcTemplate 实例");
+        assertSame(jt1, ctx2.getJdbcTemplate());
+
+        // 5. ship-new 正常工作并执行 SQL
+        Integer res = jtNew.queryForObject("SELECT 1", Integer.class);
+        assertEquals(1, res);
+
+        // 6. context 中的元数据快照同步更新为 ship-new
+        assertEquals("ship-new", ctx2.getRegistry().shipId(), "Context 中快照元数据必须同步更新为最新 shipId");
+
+        // 7. ship-old 索引已被清理且数据库查无此 shipId，访问坚决拦截
+        assertThrows(IllegalStateException.class, () -> manager.getJdbcTemplate("ship-old", null));
+
+        // 8. pool count 全局保持为 1
+        assertEquals(1, manager.listPoolSnapshots().size(), "连接池总数依然为 1，无资源泄漏");
+    }
 }
