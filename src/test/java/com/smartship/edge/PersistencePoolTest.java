@@ -111,6 +111,12 @@ class PersistencePoolTest {
             blockLatch.countDown();
             assertTrue(allCompletedLatch.await(3, TimeUnit.SECONDS), "全部 5 个任务应在 3 秒内执行完毕");
 
+            // completedTaskCount 由 ThreadPoolExecutor.afterExecute 递增，略晚于任务 finally 中的 latch，
+            // 轮询等待收敛以消除竞态（仅测试侧等待，不触及生产线程池语义）
+            long completedDeadline = System.currentTimeMillis() + 3000;
+            while (metrics.getCompletedTaskCount() != 5 && System.currentTimeMillis() < completedDeadline) {
+                Thread.sleep(20);
+            }
             assertEquals(5, metrics.getCompletedTaskCount(), "5 个任务必须全部计入已完成任务数");
             assertEquals(5, metrics.getTotalTaskCount(), "总任务数必须为 5");
         } finally {
