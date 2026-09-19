@@ -23,7 +23,7 @@ flowchart TD
     end
 
     subgraph 采集器生命周期治理 ["2. 采集器生命周期与线程治理"]
-        BaseColl[AbstractSocketCollector 模板基类] -.->|统一下沉| Impl[12类 Socket 采集器子类]
+        BaseColl[AbstractSocketCollector 模板基类] -.->|统一下沉| Impl[主动轮询与被动监听两类 Socket Collector]
         Watchdog[定时看门狗 ScheduledWatchdog] -->|心跳超时主动关闭 Socket| CloseSock[closeSocketQuietly 触发重连]
         Impl -->|生产者: 读流线程| BoundedQ[(LinkedBlockingQueue<br/>容量100 建立天然背压)]
         BoundedQ -->|消费者: 解析线程| Process[CPU 密集型报文解算]
@@ -51,13 +51,13 @@ flowchart TD
 ## 🌟 四大核心技术亮点
 
 ### 1. 船端多协议接入与 AIS 自适应身份识别
-- **物理链路弹性接入**：基于 `jSerialComm` 与 Java NIO 适配船端 RS-232/422 物理串口、虚拟 USB 串口及以太网 TCP/UDP，采用动态行缓冲区机制解决流式非结构化数据的半包与粘包。
+- **物理链路弹性接入**：基于 `jSerialComm` 适配船端 RS-232/422 物理串口与虚拟 USB 串口，以太网 TCP/UDP 采用 `java.net.Socket` / `DatagramSocket` 接入，采用动态行缓冲区机制解决流式非结构化数据的半包与粘包。
 - **严苛的异或校验（XOR Checksum）**：对 NMEA 0183 报文实现逐字节异或和比对，遇电磁脉冲误码坚决丢弃，并在业务层将航海格式坐标（$ddmm.mmmm$）精准还原为十进制度数。
 - **2000ms 内存滑动聚合**：GNSS 接收机将定位信息分散输出在 RMC（航速航向）与 GGA（海拔卫星数），系统通过分段锁与 2 秒内存滑动窗口将离散数据融合成完整的不可变业务快照。
 - **AIS 6-bit Payload 解码**：基于 ITU-R M.1371 标准自主实现 6-bit ASCII armoring 逆向映射算法，从 `!AIVDO` 报文中提取 30 位 MMSI，并引入“静态配置锁定 + 连续 3 帧防抖确认”状态机，实现船舶即插即用与免配上线。
 
 ### 2. 采集器生命周期与线程治理
-- **模板方法模式重构**：将 12 类异构设备采集器的连接、超时、线程管理与优雅停机下沉至 `AbstractSocketCollector`，消除几百行冗余代码。
+- **模板方法模式重构**：将主动轮询与被动监听两类 Socket 采集器的连接、超时、线程管理与优雅停机下沉至 `AbstractSocketCollector`，消除几百行冗余代码。
 - **命名守护线程（Daemon ThreadFactory）**：线程统一命名为 `Collector-{devCode}-{devName}-{counter}`，生产环境打 `jstack` 实现秒级定位故障设备；标记为守护线程杜绝阻碍 JVM 正常注销。
 - **看门狗自愈 TCP 半开假死**：单线程 ScheduledExecutor 维持独立看门狗，检测心跳差超时主动切断底层 Socket fd，自愈无 FIN 包的硬件断电假死连接。
 - **有界队列背压机制（Backpressure）**：读流与解析线程间采用容量为 100 的 `LinkedBlockingQueue` 解耦，消费变慢时阻塞读流反压对端，避免堆内存 OOM。
@@ -65,7 +65,7 @@ flowchart TD
 ### 3. 分船数据路由与写入保护
 - **库级数据隔离（Schema-Level Isolation）**：由 `ship_database_registry` 元数据驱动，通过 `ConcurrentHashMap` 配合 HikariCP 实现分船连接池的线程安全懒加载，将各船数据写入专属独立 Schema，杜绝跨船串库。
 - **严格准入拦截**：对未在注册表中配置或处于禁用状态（`enabled=0`）的 MMSI 实施入口级短路拦截抛出 404，防止非法数据污染。
-- **无锁 CAS 写入节流（`PersistenceThrottle`）**：针对传感器 10Hz~50Hz 的高频发射，基于 `AtomicLong` 的 CAS 自旋机制按 `MMSI:dataType` 实施最小写入间隔（默认 1 秒），快路径纳秒级短路，削减 80% 以上磁盘 I/O 写入。
+- **无锁 CAS 写入节流（`PersistenceThrottle`）**：针对传感器 10Hz~50Hz 的高频发射，基于 `AtomicLong` 的 CAS 自旋机制按 `MMSI:dataType` 实施最小写入间隔（默认 1 秒），快路径纳秒级短路，通过按 MMSI + dataType 的 CAS 写入节流降低高频重复写入。
 - **连接数严格配额**：每个分船连接池 `maximumPoolSize` 限制为 5，严格契合边缘工控机紧缺的并发资源。
 
 ### 4. 边岸协同 MQTT 增量上报与幂等指纹
@@ -91,6 +91,7 @@ smartship-edge-core/
 │   │   │   ├── collector/                    # [模块二] 采集器生命周期与线程治理
 │   │   │   │   ├── AbstractSocketCollector.java
 │   │   │   │   ├── Collectable.java
+│   │   │   │   ├── CollectorFactory.java       # 生产装配唯一入口，注入 ModbusParser
 │   │   │   │   ├── SocketListenCollector.java
 │   │   │   │   ├── SocketPollingCollector.java
 │   │   │   │   └── model/                    # ConfigDevice, BaseInfoVO 等

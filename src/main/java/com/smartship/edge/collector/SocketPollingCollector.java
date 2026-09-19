@@ -37,6 +37,8 @@ public class SocketPollingCollector extends AbstractSocketCollector {
     private final BlockingQueue<ModbusTcpResponse> responseQueue = new LinkedBlockingQueue<>(100);
 
     public SocketPollingCollector() {
+        // 仅保留给纯协议测试 / 旧接口兼容。生产创建必须走 CollectorFactory，
+        // 且生产 init 会对缺失的 ModbusParser fail-fast，杜绝静默丢数据。
     }
 
     public SocketPollingCollector(ModbusParser modbusParser) {
@@ -50,6 +52,11 @@ public class SocketPollingCollector extends AbstractSocketCollector {
 
     @Override
     public void init(ICollectService collectService, ConfigDevice device, List<ConfigVariable> variables, List<ConfigAlarm> alarms) {
+        if (modbusParser == null) {
+            throw new IllegalStateException(
+                    "[Socket-Polling] ModbusParser is required for SocketPollingCollector, "
+                            + "create via CollectorFactory.createPollingCollector()");
+        }
         super.init(collectService, device, variables, alarms);
         startTimeoutWatchdog(10000L);
     }
@@ -134,7 +141,10 @@ public class SocketPollingCollector extends AbstractSocketCollector {
 
     /**
      * 处理经过事务校验的响应
-     * 异常响应严禁调用 ModbusParser 与持久化
+     * 异常响应严禁调用 ModbusParser 与持久化。
+     * <p>
+     * 说明：parser 为 null 的分支仅服务于纯协议测试（构造后直接 pollOnce/processResponse，
+     * 不经过生产 init）；生产 init 已对缺失 Parser fail-fast，此处不会静默丢数据。
      */
     public void processResponse(ModbusTcpResponse response) {
         if (response == null) {
