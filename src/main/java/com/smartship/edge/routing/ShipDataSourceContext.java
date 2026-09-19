@@ -40,7 +40,7 @@ public class ShipDataSourceContext {
      * 判断当前数据源上下文是否已被关闭
      */
     public boolean isClosed() {
-        return closed.get() || (dataSource != null && dataSource.isClosed());
+        return closed.get() || dataSource == null || dataSource.isClosed();
     }
 
     /**

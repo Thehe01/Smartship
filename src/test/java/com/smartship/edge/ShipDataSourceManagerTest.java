@@ -13,6 +13,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 
+import java.sql.Connection;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -344,7 +345,7 @@ class ShipDataSourceManagerTest {
 
     @Test
     @DisplayName("测试场景 9: pool snapshot exposes valid Hikari metrics (PoolSnapshot 暴露完整且准确的 Hikari 指标)")
-    void testPoolSnapshotExposesValidHikariMetrics() {
+    void testPoolSnapshotExposesValidHikariMetrics() throws Exception {
         String mmsi = "413999999";
         String h2Url = "jdbc:h2:mem:ship_metrics_" + mmsi + ";DB_CLOSE_DELAY=-1;MODE=MySQL";
         insertShip("ship-1", mmsi, "zncb_ship_1", h2Url, 0, "sa", "", true);
@@ -375,6 +376,21 @@ class ShipDataSourceManagerTest {
         assertNotNull(str);
         assertTrue(str.contains("ship-db-" + mmsi));
         assertTrue(str.contains("active="));
+
+        // 深度验证：真实借出一条物理连接，验证 activeConnections 和 totalConnections 真实动态变更
+        HikariDataSource ds = manager.getDataSourceContext(mmsi).getDataSource();
+        try (Connection conn = ds.getConnection()) {
+            PoolSnapshot inUseSnapshot = manager.getPoolSnapshot(mmsi);
+            assertNotNull(inUseSnapshot);
+            assertEquals(1, inUseSnapshot.activeConnections(), "借出连接时 activeConnections 应为 1");
+            assertEquals(1, inUseSnapshot.getActiveConnections());
+            assertTrue(inUseSnapshot.totalConnections() >= 1, "借出连接时 totalConnections 应至少为 1");
+        }
+
+        // 连接归还后，activeConnections 恢复为 0
+        PoolSnapshot returnedSnapshot = manager.getPoolSnapshot(mmsi);
+        assertEquals(0, returnedSnapshot.activeConnections(), "归还连接后 activeConnections 应恢复为 0");
+        assertTrue(returnedSnapshot.idleConnections() >= 1, "连接归还后 idleConnections 应恢复");
 
         // 验证全量列表快照
         List<PoolSnapshot> list = manager.listPoolSnapshots();
@@ -466,5 +482,123 @@ class ShipDataSourceManagerTest {
         assertNotNull(jt);
         Integer res = jt.queryForObject("SELECT 1", Integer.class);
         assertEquals(1, res);
+    }
+
+    @Test
+    @DisplayName("测试场景 12: ShipDatabase.toString masks password (元数据实体字符串表示中数据库密码必须被遮蔽)")
+    void testShipDatabaseToStringMasksPassword() {
+        ShipDataSourceManager.ShipDatabase db = new ShipDataSourceManager.ShipDatabase(
+                "ship-1", "413999999", "zncb_ship", "localhost", 3306, "root", "super_secret_pass", true
+        );
+        String str = db.toString();
+        assertNotNull(str);
+        assertFalse(str.contains("super_secret_pass"), "日志与字符串表示绝对不能暴露明文密码");
+        assertTrue(str.contains("password=******"), "密码必须被星号遮蔽");
+    }
+
+    @Test
+    @DisplayName("测试场景 13: whitespace normalization and canonical routing (MMSI与shipId包含首尾空格时规范化，复用同一连接池且不泄漏)")
+    void testWhitespaceNormalizationAndCanonicalRouting() {
+        String mmsi = "413999999";
+        String h2Url = "jdbc:h2:mem:ship_norm_" + mmsi + ";DB_CLOSE_DELAY=-1;MODE=MySQL";
+        insertShip("ship-1", mmsi, "zncb_ship_1", h2Url, 0, "sa", "", true);
+
+        JdbcTemplate jt1 = manager.getJdbcTemplate(null, " 413999999 ");
+        JdbcTemplate jt2 = manager.getJdbcTemplate(null, "413999999");
+        JdbcTemplate jt3 = manager.getJdbcTemplate("  ship-1  ", null);
+
+        assertSame(jt1, jt2, "带空格的 MMSI 与标准 MMSI 获取的 JdbcTemplate 必须完全同一");
+        assertSame(jt1, jt3, "带空格的 shipId 路由获取的 JdbcTemplate 必须完全同一");
+        assertEquals(1, manager.listPoolSnapshots().size(), "底层只能存在 1 个 HikariCP 连接池");
+    }
+
+    @Test
+    @DisplayName("测试场景 14: concurrent first access mixed shipId and MMSI (多线程混合以 shipId 与 mmsi 首次并发访问，仅保留 1 个连接池)")
+    void testConcurrentFirstAccessMixedShipIdAndMmsi() throws InterruptedException {
+        String mmsi = "413888888";
+        String h2Url = "jdbc:h2:mem:ship_mixed_" + mmsi + ";DB_CLOSE_DELAY=-1;MODE=MySQL";
+        insertShip("ship-mixed", mmsi, "zncb_ship_mixed", h2Url, 0, "sa", "", true);
+
+        int threadCount = 50;
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch finishLatch = new CountDownLatch(threadCount);
+
+        List<JdbcTemplate> results = Collections.synchronizedList(new ArrayList<>());
+        List<Throwable> errors = Collections.synchronizedList(new ArrayList<>());
+
+        for (int i = 0; i < threadCount; i++) {
+            final boolean useShipId = (i % 2 == 0);
+            executor.submit(() -> {
+                try {
+                    startLatch.await();
+                    JdbcTemplate jt = useShipId
+                            ? manager.getJdbcTemplate("ship-mixed", null)
+                            : manager.getJdbcTemplate(null, mmsi);
+                    jt.execute("SELECT 1");
+                    results.add(jt);
+                } catch (Throwable t) {
+                    errors.add(t);
+                } finally {
+                    finishLatch.countDown();
+                }
+            });
+        }
+
+        startLatch.countDown();
+        assertTrue(finishLatch.await(10, TimeUnit.SECONDS));
+        executor.shutdown();
+
+        assertTrue(errors.isEmpty(), "混合并发请求必须全部成功: " + errors);
+        assertEquals(threadCount, results.size());
+
+        JdbcTemplate first = results.get(0);
+        for (JdbcTemplate jt : results) {
+            assertSame(first, jt, "所有并发线程获取的 JdbcTemplate 必须完全相同");
+        }
+        assertEquals(1, manager.listPoolSnapshots().size(), "最终只能有 1 个存活连接池");
+    }
+
+    @Test
+    @DisplayName("测试场景 15: shutdown safety rejects further operations (应用停机销毁后拒绝后续操作且不泄漏新连接池)")
+    void testShutdownSafetyRejectsFurtherOperations() {
+        String mmsi = "413999999";
+        String h2Url = "jdbc:h2:mem:ship_shutdown_" + mmsi + ";DB_CLOSE_DELAY=-1;MODE=MySQL";
+        insertShip("ship-1", mmsi, "zncb_ship_1", h2Url, 0, "sa", "", true);
+
+        manager.getJdbcTemplate(null, mmsi);
+        assertEquals(1, manager.listPoolSnapshots().size());
+
+        // 执行销毁
+        manager.closeAll();
+
+        // 销毁后调用 getJdbcTemplate 坚决拒绝并抛出 IllegalStateException，防止停机并发漏建连接池
+        assertThrows(IllegalStateException.class, () -> manager.getJdbcTemplate(null, mmsi));
+        assertThrows(IllegalStateException.class, () -> manager.refreshDataSource(mmsi));
+        assertEquals(0, manager.listPoolSnapshots().size(), "销毁后绝对不允许残留连接池");
+    }
+
+    @Test
+    @DisplayName("测试场景 16: shipId reassignment cleans old mapping (船舶变更 shipId 刷新后旧映射被清理)")
+    void testShipIdReassignmentCleansOldMapping() {
+        String mmsi = "413999999";
+        String h2Url = "jdbc:h2:mem:ship_rename_" + mmsi + ";DB_CLOSE_DELAY=-1;MODE=MySQL";
+        insertShip("ship-old", mmsi, "zncb_ship_1", h2Url, 0, "sa", "", true);
+
+        // 初始获取
+        JdbcTemplate jtOld = manager.getJdbcTemplate("ship-old", null);
+        assertNotNull(jtOld);
+
+        // 在主库中将 ship_id 更新为 ship-new，并修改 databaseName 触发刷新
+        authJdbcTemplate.update("UPDATE ship_database_registry SET ship_id = 'ship-new', database_name = 'zncb_ship_new' WHERE mmsi = ?", mmsi);
+        boolean refreshed = manager.refreshDataSource(mmsi);
+        assertTrue(refreshed);
+
+        // 使用新 shipId 获取正常
+        JdbcTemplate jtNew = manager.getJdbcTemplate("ship-new", null);
+        assertNotNull(jtNew);
+
+        // 此时旧 shipId 如果在数据库中已无记录，调用将抛出 IllegalStateException（因为旧索引已清理）
+        assertThrows(IllegalStateException.class, () -> manager.getJdbcTemplate("ship-old", null));
     }
 }

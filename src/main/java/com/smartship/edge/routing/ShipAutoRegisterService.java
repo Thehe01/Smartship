@@ -33,7 +33,15 @@ public class ShipAutoRegisterService {
             return;
         }
 
-        ShipDataSourceManager.ShipDatabase registry = shipDataSourceManager.resolveRegistry(null, mmsi);
+        ShipDataSourceManager.ShipDatabase registry;
+        try {
+            registry = shipDataSourceManager.resolveRegistry(null, mmsi);
+        } catch (Exception e) {
+            properties.setSchemaReady(false);
+            preparedMmsi = null;
+            log.warn("[AutoRegister] 查询主认证库异常: mmsi={}, err={}", mmsi, e.getMessage());
+            return;
+        }
         if (registry == null || !registry.enabled()) {
             properties.setSchemaReady(false);
             preparedMmsi = null;

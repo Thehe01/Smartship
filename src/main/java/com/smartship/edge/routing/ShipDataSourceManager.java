@@ -60,6 +60,17 @@ public class ShipDataSourceManager {
     private final ConcurrentHashMap<String, Object> locks = new ConcurrentHashMap<>();
 
     /**
+     * 生命周期停机标记，防止停机期间或停机后并发请求导致连接池泄漏
+     */
+    private volatile boolean destroyed = false;
+
+    private void checkNotDestroyed() {
+        if (this.destroyed) {
+            throw new IllegalStateException("[ShipDB] ShipDataSourceManager 已经关闭/销毁");
+        }
+    }
+
+    /**
      * 获取指定船舶对应的 JdbcTemplate（高频快路径无锁，低频未命中走线程安全初始化）
      *
      * @param shipId 船舶业务 ID（可选）
@@ -67,12 +78,15 @@ public class ShipDataSourceManager {
      * @return 绑定到专属 Hikari 连接池的 JdbcTemplate
      */
     public JdbcTemplate getJdbcTemplate(String shipId, String mmsi) {
-        if (!StringUtils.hasText(shipId) && !StringUtils.hasText(mmsi)) {
+        String cleanShipId = StringUtils.hasText(shipId) ? shipId.trim() : null;
+        String cleanMmsi = StringUtils.hasText(mmsi) ? mmsi.trim() : null;
+        if (cleanShipId == null && cleanMmsi == null) {
             throw new IllegalArgumentException("shipId 或 mmsi 不能同时为空");
         }
+        checkNotDestroyed();
 
-        // 快路径（Fast Path）：完全无锁，以 MMSI 检索 ConcurrentHashMap
-        String knownMmsi = StringUtils.hasText(mmsi) ? mmsi : shipIdToMmsi.get(shipId);
+        // 快路径（Fast Path）：完全无锁，以规范化 MMSI 检索 ConcurrentHashMap
+        String knownMmsi = cleanMmsi != null ? cleanMmsi : shipIdToMmsi.get(cleanShipId);
         if (knownMmsi != null) {
             ShipDataSourceContext context = contexts.get(knownMmsi);
             if (context != null && !context.isClosed()) {
@@ -81,7 +95,7 @@ public class ShipDataSourceManager {
         }
 
         // 慢路径（Slow Path）：首次加载或连接池已失效，进入同步初始化流程
-        return getOrCreateContext(shipId, mmsi).getJdbcTemplate();
+        return getOrCreateContext(cleanShipId, cleanMmsi).getJdbcTemplate();
     }
 
     /**
@@ -95,7 +109,8 @@ public class ShipDataSourceManager {
      * 线程安全获取或创建数据源上下文实体
      */
     private ShipDataSourceContext getOrCreateContext(String shipId, String mmsi) {
-        String knownMmsi = StringUtils.hasText(mmsi) ? mmsi : (StringUtils.hasText(shipId) ? shipIdToMmsi.get(shipId) : null);
+        checkNotDestroyed();
+        String knownMmsi = mmsi != null ? mmsi : (shipId != null ? shipIdToMmsi.get(shipId) : null);
         if (knownMmsi != null) {
             ShipDataSourceContext existing = contexts.get(knownMmsi);
             if (existing != null && !existing.isClosed()) {
@@ -115,6 +130,7 @@ public class ShipDataSourceManager {
 
         Object lock = locks.computeIfAbsent(targetMmsi, k -> new Object());
         synchronized (lock) {
+            checkNotDestroyed();
             ShipDataSourceContext existing = contexts.get(targetMmsi);
             if (existing != null && !existing.isClosed()) {
                 if (registry != null && StringUtils.hasText(registry.shipId())) {
@@ -130,6 +146,7 @@ public class ShipDataSourceManager {
                 }
             }
 
+            String canonicalMmsi = registry.mmsi();
             String fingerprint = computeFingerprint(registry);
             HikariDataSource ds = createDataSource(registry);
             JdbcTemplate jt = new JdbcTemplate(ds);
@@ -137,9 +154,14 @@ public class ShipDataSourceManager {
                     registry, ds, jt, fingerprint, System.currentTimeMillis()
             );
 
-            contexts.put(targetMmsi, newCtx);
+            if (this.destroyed) {
+                newCtx.close();
+                throw new IllegalStateException("[ShipDB] ShipDataSourceManager 已经关闭/销毁，拒绝创建新连接池");
+            }
+
+            contexts.put(canonicalMmsi, newCtx);
             if (StringUtils.hasText(registry.shipId())) {
-                shipIdToMmsi.put(registry.shipId(), targetMmsi);
+                shipIdToMmsi.put(registry.shipId(), canonicalMmsi);
             }
             return newCtx;
         }
@@ -158,36 +180,40 @@ public class ShipDataSourceManager {
      * @return true 表示成功刷新并切换为新连接池；false 表示指纹未变复用原池或已被驱逐
      */
     public boolean refreshDataSource(String mmsi) {
-        if (!StringUtils.hasText(mmsi)) {
+        String cleanMmsi = StringUtils.hasText(mmsi) ? mmsi.trim() : null;
+        if (cleanMmsi == null) {
             throw new IllegalArgumentException("mmsi 不能为空");
         }
+        checkNotDestroyed();
 
-        Object lock = locks.computeIfAbsent(mmsi, k -> new Object());
+        Object lock = locks.computeIfAbsent(cleanMmsi, k -> new Object());
         synchronized (lock) {
-            ShipDatabase registry = resolveRegistry(null, mmsi);
+            checkNotDestroyed();
+            ShipDatabase registry = resolveRegistry(null, cleanMmsi);
             if (registry == null) {
-                log.warn("[ShipDB] 船舶在注册表中不存在，执行驱逐: mmsi={}", mmsi);
-                invalidateDataSource(mmsi);
+                log.warn("[ShipDB] 船舶在注册表中不存在，执行驱逐: mmsi={}", cleanMmsi);
+                invalidateDataSource(cleanMmsi);
                 return false;
             }
 
             if (!registry.enabled()) {
-                log.warn("[ShipDB] 船舶已被禁用 (enabled=false)，主动驱逐并关闭已有连接池: mmsi={}", mmsi);
-                invalidateDataSource(mmsi);
+                log.warn("[ShipDB] 船舶已被禁用 (enabled=false)，主动驱逐并关闭已有连接池: mmsi={}", cleanMmsi);
+                invalidateDataSource(cleanMmsi);
                 return false;
             }
 
+            String canonicalMmsi = registry.mmsi();
             String newFingerprint = computeFingerprint(registry);
-            ShipDataSourceContext currentContext = contexts.get(mmsi);
+            ShipDataSourceContext currentContext = contexts.get(canonicalMmsi);
 
             // 指纹未变且原池仍存活时，直接复用
             if (currentContext != null && !currentContext.isClosed()
                     && Objects.equals(newFingerprint, currentContext.getConfigFingerprint())) {
-                log.info("[ShipDB] 船舶 MMSI: {} 配置指纹未发生变化 ({})，复用现有连接池", mmsi, newFingerprint);
+                log.info("[ShipDB] 船舶 MMSI: {} 配置指纹未发生变化 ({})，复用现有连接池", canonicalMmsi, newFingerprint);
                 return false;
             }
 
-            log.info("[ShipDB] 船舶 MMSI: {} 配置指纹发生变化或连接池未激活，开始重建连接池...", mmsi);
+            log.info("[ShipDB] 船舶 MMSI: {} 配置指纹发生变化或连接池未激活，开始重建连接池...", canonicalMmsi);
 
             // 1. 创建新连接池（若此处抛出异常，旧 pool 不会被关闭，上下文不会被污染）
             HikariDataSource newDataSource = createDataSource(registry);
@@ -200,15 +226,26 @@ public class ShipDataSourceManager {
                     System.currentTimeMillis()
             );
 
+            if (this.destroyed) {
+                newContext.close();
+                throw new IllegalStateException("[ShipDB] ShipDataSourceManager 已经关闭/销毁，拒绝刷新连接池");
+            }
+
             // 2. 替换上下文
-            ShipDataSourceContext oldContext = contexts.put(mmsi, newContext);
+            ShipDataSourceContext oldContext = contexts.put(canonicalMmsi, newContext);
             if (StringUtils.hasText(registry.shipId())) {
-                shipIdToMmsi.put(registry.shipId(), mmsi);
+                shipIdToMmsi.put(registry.shipId(), canonicalMmsi);
+            }
+            // 若旧上下文登记过不同的 shipId，清理旧 shipId 映射
+            if (oldContext != null && oldContext.getRegistry() != null
+                    && StringUtils.hasText(oldContext.getRegistry().shipId())
+                    && !oldContext.getRegistry().shipId().equals(registry.shipId())) {
+                shipIdToMmsi.remove(oldContext.getRegistry().shipId());
             }
 
             // 3. 安全关闭旧连接池
             if (oldContext != null) {
-                log.info("[ShipDB] 船舶 MMSI: {} 新连接池挂载完毕，开始安全关闭旧连接池", mmsi);
+                log.info("[ShipDB] 船舶 MMSI: {} 新连接池挂载完毕，开始安全关闭旧连接池", canonicalMmsi);
                 oldContext.close();
             }
 
@@ -223,19 +260,19 @@ public class ShipDataSourceManager {
      * @return true 表示成功驱逐并关闭；false 表示原本不存在已缓存连接池
      */
     public boolean invalidateDataSource(String mmsi) {
-        if (!StringUtils.hasText(mmsi)) {
+        String cleanMmsi = StringUtils.hasText(mmsi) ? mmsi.trim() : null;
+        if (cleanMmsi == null) {
             return false;
         }
 
-        Object lock = locks.computeIfAbsent(mmsi, k -> new Object());
+        Object lock = locks.computeIfAbsent(cleanMmsi, k -> new Object());
         synchronized (lock) {
-            ShipDataSourceContext context = contexts.remove(mmsi);
+            ShipDataSourceContext context = contexts.remove(cleanMmsi);
+            // 清理所有指向该 mmsi 的反向索引映射
+            shipIdToMmsi.values().removeIf(m -> m.equals(cleanMmsi));
             if (context != null) {
-                if (context.getRegistry() != null && StringUtils.hasText(context.getRegistry().shipId())) {
-                    shipIdToMmsi.remove(context.getRegistry().shipId());
-                }
                 context.close();
-                log.info("[ShipDB] 成功驱逐并关闭船舶 MMSI: {} 的连接池", mmsi);
+                log.info("[ShipDB] 成功驱逐并关闭船舶 MMSI: {} 的连接池", cleanMmsi);
                 return true;
             }
             return false;
@@ -249,10 +286,11 @@ public class ShipDataSourceManager {
      * @return 连接池快照，若不存在则返回 null
      */
     public PoolSnapshot getPoolSnapshot(String mmsi) {
-        if (!StringUtils.hasText(mmsi)) {
+        String cleanMmsi = StringUtils.hasText(mmsi) ? mmsi.trim() : null;
+        if (cleanMmsi == null) {
             return null;
         }
-        ShipDataSourceContext context = contexts.get(mmsi);
+        ShipDataSourceContext context = contexts.get(cleanMmsi);
         return context != null ? PoolSnapshot.of(context) : null;
     }
 
@@ -262,7 +300,10 @@ public class ShipDataSourceManager {
     public List<PoolSnapshot> listPoolSnapshots() {
         List<PoolSnapshot> snapshots = new ArrayList<>(contexts.size());
         for (ShipDataSourceContext ctx : contexts.values()) {
-            snapshots.add(PoolSnapshot.of(ctx));
+            PoolSnapshot snapshot = PoolSnapshot.of(ctx);
+            if (snapshot != null) {
+                snapshots.add(snapshot);
+            }
         }
         return Collections.unmodifiableList(snapshots);
     }
@@ -271,10 +312,11 @@ public class ShipDataSourceManager {
      * 获取指定 MMSI 的数据源治理上下文（供治理探测与单元测试验证）
      */
     public ShipDataSourceContext getDataSourceContext(String mmsi) {
-        if (!StringUtils.hasText(mmsi)) {
+        String cleanMmsi = StringUtils.hasText(mmsi) ? mmsi.trim() : null;
+        if (cleanMmsi == null) {
             return null;
         }
-        return contexts.get(mmsi);
+        return contexts.get(cleanMmsi);
     }
 
     /**
@@ -283,6 +325,15 @@ public class ShipDataSourceManager {
     @PreDestroy
     public synchronized void closeAll() {
         log.info("[ShipDB] 正在统一关闭全部动态分船连接池 (当前活动池数: {})...", contexts.size());
+        this.destroyed = true;
+
+        // 对每一个锁进行同步以等待当前正在执行中的初始化或刷新退出
+        for (Object lock : locks.values()) {
+            synchronized (lock) {
+                // 等待在途临界区结束
+            }
+        }
+
         for (Map.Entry<String, ShipDataSourceContext> entry : contexts.entrySet()) {
             try {
                 entry.getValue().close();
@@ -331,12 +382,14 @@ public class ShipDataSourceManager {
      * - 数据库/网络查询异常：抛出 RegistryQueryException，杜绝误判为“船舶不存在”并误删正常池
      */
     public ShipDatabase resolveRegistry(String shipId, String mmsi) {
-        if (!StringUtils.hasText(shipId) && !StringUtils.hasText(mmsi)) {
+        String cleanShipId = StringUtils.hasText(shipId) ? shipId.trim() : null;
+        String cleanMmsi = StringUtils.hasText(mmsi) ? mmsi.trim() : null;
+        if (cleanShipId == null && cleanMmsi == null) {
             throw new IllegalArgumentException("shipId 或 mmsi 不能同时为空");
         }
 
-        String where = StringUtils.hasText(shipId) ? "ship_id = ?" : "mmsi = ?";
-        Object arg = StringUtils.hasText(shipId) ? shipId : mmsi;
+        String where = cleanMmsi != null ? "mmsi = ?" : "ship_id = ?";
+        Object arg = cleanMmsi != null ? cleanMmsi : cleanShipId;
         try {
             return authJdbcTemplate.query("""
                             SELECT ship_id, mmsi, database_name, host, port, username, password, enabled
@@ -346,9 +399,9 @@ public class ShipDataSourceManager {
                             """.formatted(where),
                     rs -> rs.next()
                             ? new ShipDatabase(
-                            rs.getString("ship_id"),
-                            rs.getString("mmsi"),
-                            rs.getString("database_name"),
+                            rs.getString("ship_id") != null ? rs.getString("ship_id").trim() : null,
+                            rs.getString("mmsi") != null ? rs.getString("mmsi").trim() : null,
+                            rs.getString("database_name") != null ? rs.getString("database_name").trim() : null,
                             firstText(rs.getString("host"), properties.getDatasource().getShip().getDefaultHost()),
                             rs.getObject("port") == null ? properties.getDatasource().getShip().getDefaultPort() : rs.getInt("port"),
                             firstText(rs.getString("username"), properties.getDatasource().getShip().getDefaultUsername()),
@@ -359,10 +412,10 @@ public class ShipDataSourceManager {
         } catch (EmptyResultDataAccessException e) {
             return null;
         } catch (DataAccessException e) {
-            log.error("[ShipDB] 查询主认证数据库异常: shipId={}, mmsi={}, error={}", shipId, mmsi, e.getMessage());
+            log.error("[ShipDB] 查询主认证数据库异常: shipId={}, mmsi={}, error={}", cleanShipId, cleanMmsi, e.getMessage());
             throw new RegistryQueryException("Failed to query ship database registry: " + e.getMessage(), e);
         } catch (Exception e) {
-            log.error("[ShipDB] 查询船舶注册表未知异常: shipId={}, mmsi={}, error={}", shipId, mmsi, e.getMessage());
+            log.error("[ShipDB] 查询船舶注册表未知异常: shipId={}, mmsi={}, error={}", cleanShipId, cleanMmsi, e.getMessage());
             throw new RegistryQueryException("Unexpected error querying ship database registry: " + e.getMessage(), e);
         }
     }
@@ -379,9 +432,9 @@ public class ShipDataSourceManager {
                             ORDER BY id
                             """,
                     (rs, rowNum) -> new ShipDatabase(
-                            rs.getString("ship_id"),
-                            rs.getString("mmsi"),
-                            rs.getString("database_name"),
+                            rs.getString("ship_id") != null ? rs.getString("ship_id").trim() : null,
+                            rs.getString("mmsi") != null ? rs.getString("mmsi").trim() : null,
+                            rs.getString("database_name") != null ? rs.getString("database_name").trim() : null,
                             firstText(rs.getString("host"), properties.getDatasource().getShip().getDefaultHost()),
                             rs.getObject("port") == null ? properties.getDatasource().getShip().getDefaultPort() : rs.getInt("port"),
                             firstText(rs.getString("username"), properties.getDatasource().getShip().getDefaultUsername()),
@@ -444,5 +497,18 @@ public class ShipDataSourceManager {
 
     public record ShipDatabase(String shipId, String mmsi, String databaseName, String host, int port,
                                String username, String password, boolean enabled) {
+        @Override
+        public String toString() {
+            return "ShipDatabase[" +
+                    "shipId=" + shipId +
+                    ", mmsi=" + mmsi +
+                    ", databaseName=" + databaseName +
+                    ", host=" + host +
+                    ", port=" + port +
+                    ", username=" + username +
+                    ", password=******" +
+                    ", enabled=" + enabled +
+                    ']';
+        }
     }
 }
