@@ -7,8 +7,11 @@ import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -27,7 +30,10 @@ public final class ModbusTcpDeviceSimulator implements AutoCloseable {
     private final ServerSocket serverSocket;
     private final ExecutorService workers;
     private final AtomicBoolean running = new AtomicBoolean(true);
+    private final AtomicBoolean closed = new AtomicBoolean(false);
     private final Thread acceptThread;
+    /** 全部已 accept 且尚未退出的 client 连接，close 时逐个关闭以解阻塞 read。 */
+    private final Set<Socket> activeSockets = ConcurrentHashMap.newKeySet();
 
     private final AtomicLong requestsReceived = new AtomicLong();
     private final AtomicLong responsesSent = new AtomicLong();
@@ -76,10 +82,27 @@ public final class ModbusTcpDeviceSimulator implements AutoCloseable {
 
     private void acceptLoop() {
         while (running.get()) {
+            Socket socket = null;
             try {
-                Socket socket = serverSocket.accept();
-                workers.submit(() -> serve(socket));
+                socket = serverSocket.accept();
+                if (!running.get()) {
+                    closeQuietly(socket);
+                    break;
+                }
+                activeSockets.add(socket);
+                final Socket accepted = socket;
+                try {
+                    workers.submit(() -> serve(accepted));
+                } catch (java.util.concurrent.RejectedExecutionException e) {
+                    // close() 并发跑完导致任务被拒：绝不泄漏，必须摘除并关闭该连接
+                    activeSockets.remove(accepted);
+                    closeQuietly(accepted);
+                }
             } catch (IOException e) {
+                if (socket != null) {
+                    activeSockets.remove(socket);
+                    closeQuietly(socket);
+                }
                 if (running.get()) {
                     // 运行期 accept 异常仅记录，关闭期属于正常退出
                     System.err.println("[ModbusSim] accept 异常: " + e.getMessage());
@@ -162,6 +185,8 @@ public final class ModbusTcpDeviceSimulator implements AutoCloseable {
             }
         } catch (IOException ignored) {
             // 客户端断开属于正常现象
+        } finally {
+            activeSockets.remove(socket);
         }
     }
 
@@ -204,8 +229,16 @@ public final class ModbusTcpDeviceSimulator implements AutoCloseable {
         return frame;
     }
 
-    private static void readFully(InputStream in, byte[] buf, int off, int len) throws IOException {
-        int total = 0;
+    private static void closeQuietly(Socket socket) {
+        if (socket != null) {
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
+    private static void readFully(InputStream in, byte[] buf, int off, int len) throws IOException {        int total = 0;
         while (total < len) {
             int n = in.read(buf, off + total, len - total);
             if (n == -1) {
@@ -215,13 +248,51 @@ public final class ModbusTcpDeviceSimulator implements AutoCloseable {
         }
     }
 
+    /** 仅供测试使用的内省接口：当前存活 client 连接数。 */
+    public int activeConnectionCount() {
+        return activeSockets.size();
+    }
+
+    /** 仅供测试使用的内省接口：worker 池是否已终止。 */
+    public boolean isTerminated() {
+        return workers.isTerminated();
+    }
+
+    /** 仅供测试使用的内省接口：accept 线程是否仍存活。 */
+    public boolean isAcceptThreadAlive() {
+        return acceptThread.isAlive();
+    }
+
+    /**
+     * 幂等关闭：停 accept → 关 client sockets（解阻塞 read）→ 关 serverSocket →
+     * shutdown workers 并等待 → join accept 线程。连续调用不得异常。
+     */
     @Override
     public void close() {
+        if (!closed.compareAndSet(false, true)) {
+            return;
+        }
         running.set(false);
+        for (Socket s : activeSockets) {
+            try {
+                s.close();
+            } catch (IOException ignored) {
+            }
+        }
         try {
             serverSocket.close();
         } catch (IOException ignored) {
         }
         workers.shutdownNow();
+        try {
+            workers.awaitTermination(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        try {
+            acceptThread.join(5000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 }

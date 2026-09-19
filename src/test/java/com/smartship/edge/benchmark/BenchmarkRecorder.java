@@ -18,22 +18,19 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
-import java.util.concurrent.TimeUnit;
 
 /**
- * P1-4 统一 Benchmark 结果记录器（测试作用域，不污染生产代码）。
+ * P1-4 统一 Benchmark 结果记录器（P1-4.1 run isolation + named measurements）。
  * <p>
- * 职责：
- * 1. 收集各场景原始计数、延迟样本（纳秒）与观测峰值，只做描述性统计
- *    （throughput / p50 / p95 / p99 / max / median），不输出任何预设性能结论；
- * 2. 每个场景完成后立即落盘 {@code target/benchmark/scenario-<name>.json}，
- *    测试失败也不丢失已完成场景；
- * 3. {@link #flush()} 将全部已完成场景汇总为
- *    {@code benchmark-summary.json / .csv / benchmark-report.md}。
+ * 规则：
+ * 1. 所有写入只进当前 {@link BenchmarkRunContext#runDir()}，{@code loadAll} 只扫描
+ *    本轮目录，报告绝不混入历史 run；
+ * 2. 不同语义的延迟必须用命名组区分（{@link Scenario#recordLatency}），禁止混算一个 percentile；
+ *    单值型测量（recovery_ms / refresh_ms）用 {@link Scenario#measure}，报告给出 runs + median；
+ * 3. 只做描述性统计，不输出任何预设性能结论；削减率必须经
+ *    {@link #throttleReductionRatio} 由实测行数计算。
  */
 public class BenchmarkRecorder {
-
-    private static final Path BENCH_DIR = Paths.get("target", "benchmark");
 
     private static final ObjectMapper MAPPER = new ObjectMapper()
             .enable(SerializationFeature.INDENT_OUTPUT);
@@ -62,7 +59,8 @@ public class BenchmarkRecorder {
         private final Map<String, String> params = new LinkedHashMap<>();
         private final Map<String, Long> counters = new LinkedHashMap<>();
         private final Map<String, Double> peaks = new LinkedHashMap<>();
-        private final List<Long> latenciesNanos = new ArrayList<>();
+        /** 命名测量组 → 毫秒样本（recordLatency 换算自纳秒，measure 直接记毫秒）。 */
+        private final Map<String, List<Double>> measuresMs = new LinkedHashMap<>();
         private final List<Double> runThroughputs = new ArrayList<>();
         private final List<String> notes = new ArrayList<>();
 
@@ -85,8 +83,20 @@ public class BenchmarkRecorder {
             return this;
         }
 
+        /** 命名延迟样本（纳秒），不同语义必须用不同组名。 */
+        public Scenario recordLatency(String group, long nanos) {
+            measuresMs.computeIfAbsent(group, k -> new ArrayList<>()).add(Math.max(0, nanos) / 1_000_000.0);
+            return this;
+        }
+
+        /** 兼容旧调用：归入 {@code default} 组；新代码应使用命名组。 */
         public Scenario recordLatencyNanos(long nanos) {
-            latenciesNanos.add(Math.max(0, nanos));
+            return recordLatency("default", nanos);
+        }
+
+        /** 单值型测量（毫秒），如 recovery_ms / refresh_ms：每轮 measured 记录一次。 */
+        public Scenario measure(String group, double millis) {
+            measuresMs.computeIfAbsent(group, k -> new ArrayList<>()).add(millis);
             return this;
         }
 
@@ -106,22 +116,20 @@ public class BenchmarkRecorder {
     }
 
     /**
-     * 完成一个场景：计算统计、落盘单场景文件并刷新汇总。每次场景结束调用一次；
-     * 建议在 {@code @AfterAll} 再调一次 {@link #flush()} 兜底。
+     * 完成一个场景：计算统计、落盘本轮单场景文件并刷新本轮汇总。
+     * 每次场景结束调用一次；建议在 {@code @AfterAll} 再调一次 {@link #flush()} 兜底。
      */
     public ScenarioResult complete(Scenario scenario) {
-        List<Long> sorted = new ArrayList<>(scenario.latenciesNanos);
-        Collections.sort(sorted);
+        Map<String, MeasureStats> groups = new LinkedHashMap<>();
+        for (Map.Entry<String, List<Double>> e : scenario.measuresMs.entrySet()) {
+            groups.put(e.getKey(), MeasureStats.of(e.getValue()));
+        }
         ScenarioResult result = new ScenarioResult(
                 scenario.name,
                 Map.copyOf(scenario.params),
                 Map.copyOf(scenario.counters),
                 Map.copyOf(scenario.peaks),
-                sorted.size(),
-                sorted.isEmpty() ? 0.0 : toMillis(percentile(sorted, 50)),
-                sorted.isEmpty() ? 0.0 : toMillis(percentile(sorted, 95)),
-                sorted.isEmpty() ? 0.0 : toMillis(percentile(sorted, 99)),
-                sorted.isEmpty() ? 0.0 : toMillis(sorted.get(sorted.size() - 1)),
+                groups,
                 medianDouble(scenario.runThroughputs),
                 List.copyOf(scenario.runThroughputs),
                 List.copyOf(scenario.notes));
@@ -129,8 +137,9 @@ public class BenchmarkRecorder {
             COMPLETED.put(result.name(), result);
         }
         try {
-            Files.createDirectories(BENCH_DIR);
-            writeJson(BENCH_DIR.resolve("scenario-" + sanitize(result.name()) + ".json"),
+            Path dir = BenchmarkRunContext.runDir();
+            Files.createDirectories(dir);
+            writeJson(dir.resolve("scenario-" + sanitize(result.name()) + ".json"),
                     Map.of("scenario", result.asMap(), "env", envMeta(runParams)));
         } catch (IOException e) {
             System.err.println("[Benchmark] 场景文件落盘失败: " + result.name() + ": " + e.getMessage());
@@ -139,15 +148,16 @@ public class BenchmarkRecorder {
         return result;
     }
 
-    // ==================== 汇总输出 ====================
+    // ==================== 汇总输出（仅本轮） ====================
 
     /**
-     * 基于磁盘上全部 {@code scenario-*.json} 重建三份汇总文件。
-     * 只汇总真实存在的结果文件，不虚构未运行场景。
+     * 基于本轮目录 + 内存注册表重建三份汇总文件，并刷新 {@code latest-run.txt}。
+     * 只汇总本轮真实存在的结果，不扫描历史 run。
      */
     public void flush() {
         try {
-            Files.createDirectories(BENCH_DIR);
+            Path dir = BenchmarkRunContext.runDir();
+            Files.createDirectories(dir);
             Map<String, ScenarioResult> all = loadAll();
             List<Map<String, Object>> rows = new ArrayList<>();
             for (ScenarioResult r : all.values()) {
@@ -156,50 +166,53 @@ public class BenchmarkRecorder {
             Map<String, Object> summary = new LinkedHashMap<>();
             summary.put("env", envMeta(runParams));
             summary.put("scenarios", rows);
-            writeJson(BENCH_DIR.resolve("benchmark-summary.json"), summary);
-            Files.writeString(BENCH_DIR.resolve("benchmark-summary.csv"), toCsv(all), StandardCharsets.UTF_8);
-            Files.writeString(BENCH_DIR.resolve("benchmark-report.md"), toMarkdown(all), StandardCharsets.UTF_8);
+            writeJson(dir.resolve("benchmark-summary.json"), summary);
+            Files.writeString(dir.resolve("benchmark-summary.csv"), toCsv(all), StandardCharsets.UTF_8);
+            Files.writeString(dir.resolve("benchmark-report.md"), toMarkdown(all), StandardCharsets.UTF_8);
+            Files.writeString(Paths.get("target", "benchmark", "latest-run.txt"),
+                    BenchmarkRunContext.runId() + "\n", StandardCharsets.UTF_8);
         } catch (IOException e) {
             System.err.println("[Benchmark] 汇总落盘失败: " + e.getMessage());
         }
     }
 
-    private static Map<String, ScenarioResult> loadAll() {
+    /** 只读本轮目录（+ 内存），绝不递归历史 run。 */
+    static Map<String, ScenarioResult> loadAll() {
         Map<String, ScenarioResult> merged = new LinkedHashMap<>();
         synchronized (COMPLETED) {
             merged.putAll(COMPLETED);
         }
-        if (!Files.isDirectory(BENCH_DIR)) {
-            return merged;
-        }
-        try (var stream = Files.list(BENCH_DIR)) {
-            for (Path p : (Iterable<Path>) stream.filter(f -> {
-                String n = f.getFileName().toString();
-                return n.startsWith("scenario-") && n.endsWith(".json");
-            })::iterator) {
-                try {
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> root = MAPPER.readValue(p.toFile(), Map.class);
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> s = (Map<String, Object>) root.get("scenario");
-                    if (s != null && s.get("name") != null) {
-                        merged.putIfAbsent(String.valueOf(s.get("name")), ScenarioResult.fromMap(s));
+        Path dir = BenchmarkRunContext.runDir();
+        if (Files.isDirectory(dir)) {
+            try (var stream = Files.list(dir)) {
+                for (Path p : (Iterable<Path>) stream.filter(f -> {
+                    String n = f.getFileName().toString();
+                    return n.startsWith("scenario-") && n.endsWith(".json");
+                })::iterator) {
+                    try {
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> root = MAPPER.readValue(p.toFile(), Map.class);
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> s = (Map<String, Object>) root.get("scenario");
+                        if (s != null && s.get("name") != null) {
+                            merged.putIfAbsent(String.valueOf(s.get("name")), ScenarioResult.fromMap(s));
+                        }
+                    } catch (Exception ignored) {
+                        // 单个损坏文件不影响其他场景
                     }
-                } catch (Exception ignored) {
-                    // 单个损坏文件不影响其他场景
                 }
+            } catch (IOException ignored) {
             }
-        } catch (IOException ignored) {
         }
-        // 按场景名排序，保证输出稳定可 diff
-        Map<String, ScenarioResult> sorted = new TreeMap<>(merged);
-        return sorted;
+        return new TreeMap<>(merged);
     }
 
     // ==================== 环境元数据 ====================
 
     public static Map<String, Object> envMeta(Map<String, String> params) {
         Map<String, Object> env = new LinkedHashMap<>();
+        env.put("run_id", BenchmarkRunContext.runId());
+        env.put("run_started_at", BenchmarkRunContext.startedAt());
         env.put("timestamp", DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(
                 Instant.now().atOffset(ZoneOffset.ofHours(8))));
         env.put("java_version", System.getProperty("java.version", "unknown"));
@@ -208,26 +221,9 @@ public class BenchmarkRecorder {
         env.put("os", System.getProperty("os.name", "unknown") + " "
                 + System.getProperty("os.version", ""));
         env.put("spring_boot_version", SpringBootVersion.getVersion());
-        env.put("git_commit", gitCommit());
+        env.put("git_commit", BenchmarkRunContext.gitCommit());
         env.put("params", params != null ? new LinkedHashMap<>(params) : Map.of());
         return env;
-    }
-
-    private static String gitCommit() {
-        try {
-            Process proc = new ProcessBuilder("git", "rev-parse", "--short", "HEAD")
-                    .redirectErrorStream(true)
-                    .start();
-            boolean done = proc.waitFor(5, TimeUnit.SECONDS);
-            if (!done) {
-                proc.destroyForcibly();
-                return "unknown";
-            }
-            String out = new String(proc.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
-            return out.isEmpty() ? "unknown" : out;
-        } catch (Exception e) {
-            return "unknown";
-        }
     }
 
     // ==================== 统计工具 ====================
@@ -240,6 +236,16 @@ public class BenchmarkRecorder {
         return sortedAscending.get(Math.min(Math.max(idx, 0), sortedAscending.size() - 1));
     }
 
+    public static double percentileDouble(List<Double> values, double p) {
+        if (values == null || values.isEmpty()) {
+            return 0.0;
+        }
+        List<Double> sorted = new ArrayList<>(values);
+        Collections.sort(sorted);
+        int idx = (int) Math.ceil(p / 100.0 * sorted.size()) - 1;
+        return sorted.get(Math.min(Math.max(idx, 0), sorted.size() - 1));
+    }
+
     public static double medianDouble(List<Double> values) {
         if (values == null || values.isEmpty()) {
             return 0.0;
@@ -250,8 +256,18 @@ public class BenchmarkRecorder {
         return n % 2 == 1 ? sorted.get(n / 2) : (sorted.get(n / 2 - 1) + sorted.get(n / 2)) / 2.0;
     }
 
-    private static double toMillis(long nanos) {
-        return nanos / 1_000_000.0;
+    /**
+     * PersistenceThrottle 写入削减率（严格 A/B 口径）。
+     *
+     * @param baselineRows  同一 dataset 在 throttle=0 下的实测入库行数
+     * @param throttledRows 同一 dataset 在 throttle>0 下的实测入库行数
+     * @return {@code 1 - throttled/baseline}；baseline 为 0 时返回 {@code null}（N/A），禁止除以有效消息数
+     */
+    public static Double throttleReductionRatio(long baselineRows, long throttledRows) {
+        if (baselineRows <= 0) {
+            return null;
+        }
+        return 1.0 - (double) throttledRows / baselineRows;
     }
 
     // ==================== 文件格式 ====================
@@ -266,15 +282,24 @@ public class BenchmarkRecorder {
 
     private static String toCsv(Map<String, ScenarioResult> all) {
         StringBuilder sb = new StringBuilder(
-                "scenario,latency_samples,throughput_median_per_sec,p50_ms,p95_ms,p99_ms,max_ms\n");
+                "scenario,measure_group,samples,throughput_median_per_sec,p50_ms,p95_ms,p99_ms,max_ms,median_ms\n");
         for (ScenarioResult r : all.values()) {
-            sb.append(csv(r.name())).append(',')
-                    .append(r.latencySamples()).append(',')
-                    .append(fmt(r.throughputMedian())).append(',')
-                    .append(fmt(r.p50Ms())).append(',')
-                    .append(fmt(r.p95Ms())).append(',')
-                    .append(fmt(r.p99Ms())).append(',')
-                    .append(fmt(r.maxMs())).append('\n');
+            if (r.groups().isEmpty()) {
+                sb.append(csv(r.name())).append(",,0,")
+                        .append(fmt(r.throughputMedian())).append(",,,,,\n");
+            } else {
+                for (Map.Entry<String, MeasureStats> g : r.groups().entrySet()) {
+                    MeasureStats st = g.getValue();
+                    sb.append(csv(r.name())).append(',').append(csv(g.getKey())).append(',')
+                            .append(st.count()).append(',')
+                            .append(fmt(r.throughputMedian())).append(',')
+                            .append(fmt(st.p50())).append(',')
+                            .append(fmt(st.p95())).append(',')
+                            .append(fmt(st.p99())).append(',')
+                            .append(fmt(st.max())).append(',')
+                            .append(fmt(st.median())).append('\n');
+                }
+            }
         }
         return sb.toString();
     }
@@ -283,18 +308,22 @@ public class BenchmarkRecorder {
         return "\"" + s.replace("\"", "\"\"") + "\"";
     }
 
-    private static String fmt(double v) {
+    static String fmt(double v) {
         return String.format(java.util.Locale.ROOT, "%.3f", v);
     }
 
     private static String toMarkdown(Map<String, ScenarioResult> all) {
         StringBuilder sb = new StringBuilder("# SmartShip Edge Benchmark Report\n\n");
-        sb.append("> 本报告全部数字来自本次真实运行的原始测量；未运行场景不会出现在本文件中。\n");
-        sb.append("> 测量值仅描述当前测试环境（见 Environment），不得直接宣称为生产环境性能。\n\n");
-        sb.append("## Environment\n\n");
+        sb.append("> 本报告全部数字来自本轮独立实验的原始测量；未运行场景不会出现。\n");
+        sb.append("> 测量值仅描述当前测试环境，不得直接宣称为生产环境性能。\n\n");
         Map<String, Object> env = envMeta(Map.of());
+        sb.append("Run ID: ").append(env.get("run_id")).append('\n');
+        sb.append("Git Commit: ").append(env.get("git_commit")).append('\n');
+        sb.append("Started At: ").append(env.get("run_started_at")).append('\n');
+        sb.append("\n## Environment\n\n");
         for (Map.Entry<String, Object> e : env.entrySet()) {
-            if ("params".equals(e.getKey())) {
+            if ("params".equals(e.getKey()) || "run_id".equals(e.getKey())
+                    || "run_started_at".equals(e.getKey())) {
                 continue;
             }
             sb.append("- ").append(e.getKey()).append(": ").append(e.getValue()).append('\n');
@@ -319,11 +348,26 @@ public class BenchmarkRecorder {
                     sb.append("- ").append(e.getKey()).append(": ").append(fmt(e.getValue())).append('\n');
                 }
             }
-            sb.append("\nLatency (ms over ").append(r.latencySamples()).append(" samples):\n");
-            sb.append("- p50: ").append(fmt(r.p50Ms())).append('\n');
-            sb.append("- p95: ").append(fmt(r.p95Ms())).append('\n');
-            sb.append("- p99: ").append(fmt(r.p99Ms())).append('\n');
-            sb.append("- max: ").append(fmt(r.maxMs())).append('\n');
+            for (Map.Entry<String, MeasureStats> g : r.groups().entrySet()) {
+                MeasureStats st = g.getValue();
+                sb.append("\nLatency[").append(g.getKey()).append("] (ms over ")
+                        .append(st.count()).append(" samples):\n");
+                sb.append("- p50: ").append(fmt(st.p50())).append('\n');
+                sb.append("- p95: ").append(fmt(st.p95())).append('\n');
+                sb.append("- p99: ").append(fmt(st.p99())).append('\n');
+                sb.append("- max: ").append(fmt(st.max())).append('\n');
+                sb.append("- median: ").append(fmt(st.median())).append('\n');
+                if (!st.values().isEmpty() && st.count() <= 32) {
+                    sb.append("- runs: [");
+                    for (int i = 0; i < st.values().size(); i++) {
+                        if (i > 0) {
+                            sb.append(", ");
+                        }
+                        sb.append(fmt(st.values().get(i)));
+                    }
+                    sb.append("]\n");
+                }
+            }
             sb.append("\nThroughput:\n");
             sb.append("- median_per_sec: ").append(fmt(r.throughputMedian())).append('\n');
             if (!r.runThroughputs().isEmpty()) {
@@ -348,16 +392,58 @@ public class BenchmarkRecorder {
 
     // ==================== 不可变结果 ====================
 
+    public record MeasureStats(int count, double p50, double p95, double p99,
+                               double max, double median, List<Double> values) {
+        static MeasureStats of(List<Double> millis) {
+            List<Double> sorted = new ArrayList<>(millis);
+            Collections.sort(sorted);
+            return new MeasureStats(
+                    sorted.size(),
+                    percentileDouble(sorted, 50),
+                    percentileDouble(sorted, 95),
+                    percentileDouble(sorted, 99),
+                    sorted.isEmpty() ? 0.0 : sorted.get(sorted.size() - 1),
+                    medianDouble(sorted),
+                    List.copyOf(sorted));
+
+        }
+
+        Map<String, Object> asMap() {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("samples", count);
+            m.put("p50_ms", p50);
+            m.put("p95_ms", p95);
+            m.put("p99_ms", p99);
+            m.put("max_ms", max);
+            m.put("median_ms", median);
+            m.put("values_ms", values);
+            return m;
+        }
+
+        @SuppressWarnings("unchecked")
+        static MeasureStats fromMap(Map<String, Object> m) {
+            List<Double> values = new ArrayList<>();
+            Object v = m.get("values_ms");
+            if (v instanceof List<?> l) {
+                l.forEach(x -> values.add(((Number) x).doubleValue()));
+            }
+            return new MeasureStats(
+                    ((Number) m.getOrDefault("samples", values.size())).intValue(),
+                    ((Number) m.getOrDefault("p50_ms", 0)).doubleValue(),
+                    ((Number) m.getOrDefault("p95_ms", 0)).doubleValue(),
+                    ((Number) m.getOrDefault("p99_ms", 0)).doubleValue(),
+                    ((Number) m.getOrDefault("max_ms", 0)).doubleValue(),
+                    ((Number) m.getOrDefault("median_ms", 0)).doubleValue(),
+                    values);
+        }
+    }
+
     public record ScenarioResult(
             String name,
             Map<String, String> params,
             Map<String, Long> counters,
             Map<String, Double> peaks,
-            int latencySamples,
-            double p50Ms,
-            double p95Ms,
-            double p99Ms,
-            double maxMs,
+            Map<String, MeasureStats> groups,
             double throughputMedian,
             List<Double> runThroughputs,
             List<String> notes) {
@@ -368,11 +454,11 @@ public class BenchmarkRecorder {
             m.put("params", params);
             m.put("counters", counters);
             m.put("peaks", peaks);
-            m.put("latency_samples", latencySamples);
-            m.put("p50_ms", p50Ms);
-            m.put("p95_ms", p95Ms);
-            m.put("p99_ms", p99Ms);
-            m.put("max_ms", maxMs);
+            Map<String, Object> g = new LinkedHashMap<>();
+            for (Map.Entry<String, MeasureStats> e : groups.entrySet()) {
+                g.put(e.getKey(), e.getValue().asMap());
+            }
+            m.put("measure_groups", g);
             m.put("throughput_median_per_sec", throughputMedian);
             m.put("throughput_runs_per_sec", runThroughputs);
             m.put("notes", notes);
@@ -381,16 +467,18 @@ public class BenchmarkRecorder {
 
         @SuppressWarnings("unchecked")
         static ScenarioResult fromMap(Map<String, Object> m) {
+            Map<String, MeasureStats> groups = new LinkedHashMap<>();
+            Object g = m.get("measure_groups");
+            if (g instanceof Map<?, ?> gm) {
+                gm.forEach((k, v) -> groups.put(String.valueOf(k),
+                        MeasureStats.fromMap((Map<String, Object>) v)));
+            }
             return new ScenarioResult(
                     String.valueOf(m.get("name")),
                     (Map<String, String>) m.getOrDefault("params", Map.of()),
                     numMap(m.get("counters")),
                     dblMap(m.get("peaks")),
-                    ((Number) m.getOrDefault("latency_samples", 0)).intValue(),
-                    ((Number) m.getOrDefault("p50_ms", 0)).doubleValue(),
-                    ((Number) m.getOrDefault("p95_ms", 0)).doubleValue(),
-                    ((Number) m.getOrDefault("p99_ms", 0)).doubleValue(),
-                    ((Number) m.getOrDefault("max_ms", 0)).doubleValue(),
+                    groups,
                     ((Number) m.getOrDefault("throughput_median_per_sec", 0)).doubleValue(),
                     dblList(m.get("throughput_runs_per_sec")),
                     strList(m.get("notes")));

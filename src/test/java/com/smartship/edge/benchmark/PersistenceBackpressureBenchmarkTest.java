@@ -156,12 +156,15 @@ class PersistenceBackpressureBenchmarkTest {
                     "persistence-backpressure-t" + tasks + "-l" + latencyMs)
                     .param("tasks", tasks)
                     .param("db_latency_ms", latencyMs)
+                    .param("warmup_runs", 1)
+                    .param("measured_runs", 3)
                     .note("submit latency 为单次 submit() 调用耗时（含 CallerRuns 内联执行）；"
                             + "reject_count 为降级次数；CallerRuns 内联任务不经过 worker 线程的 afterExecute，"
                             + "因此 completedTaskCount 天然少计 reject 部分，完成判定以 completed + reject 为准；"
-                            + "所有任务均执行，无丢弃");
+                            + "所有任务均执行，无丢弃；计数器取末轮 measured 单轮值");
             for (int run = 0; run < 4; run++) {
                 boolean warmup = run == 0;
+                boolean last = run == 3;
                 policy.resetRejectCount();
                 long completedBase = metrics.getCompletedTaskCount();
                 CountDownLatch latch = new CountDownLatch(tasks);
@@ -196,7 +199,7 @@ class PersistenceBackpressureBenchmarkTest {
                 double elapsedSec = (System.nanoTime() - t0) / 1e9;
                 if (!warmup) {
                     for (long nanos : submitNanos) {
-                        s.recordLatencyNanos(nanos);
+                        s.recordLatency("submit", nanos);
                     }
                     long completedDelta = metrics.getCompletedTaskCount() - completedBase;
                     long accounted = completedDelta + policy.getRejectCount();
@@ -204,10 +207,12 @@ class PersistenceBackpressureBenchmarkTest {
                             "t=" + tasks + "/l=" + latencyMs + ": worker 完成 + CallerRuns 必须等于提交数，无丢弃");
                     assertTrue(queuePeak[0] <= 500,
                             "t=" + tasks + "/l=" + latencyMs + ": 队列必须有界 (<=500)");
-                    s.count("submitted", tasks)
-                            .count("completed_worker", completedDelta)
-                            .count("reject_count", policy.getRejectCount())
-                            .observePeak("queue_peak", queuePeak[0]);
+                    if (last) {
+                        s.count("submitted", tasks)
+                                .count("completed_worker", completedDelta)
+                                .count("reject_count", policy.getRejectCount())
+                                .observePeak("queue_peak", queuePeak[0]);
+                    }
                     s.addRunThroughput(tasks / elapsedSec);
                 }
             }

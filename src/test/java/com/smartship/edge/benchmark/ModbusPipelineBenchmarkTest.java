@@ -130,10 +130,15 @@ class ModbusPipelineBenchmarkTest {
                 .param("devices", 1)
                 .param("poll_interval_ms", 5)
                 .param("duration_seconds", durationSeconds())
-                .note("主路径为 Collector 异步线程真实 Socket 轮询；latency 另由同步 pollOnce 回环补充测量");
+                .param("warmup_runs", 1)
+                .param("measured_runs", 3)
+                .param("sync_roundtrips_per_run", 200)
+                .note("主路径为 Collector 异步线程真实 Socket 轮询；roundtrip 延迟由同步 pollOnce 回环补充测量；"
+                        + "计数器取末轮 measured 单轮值");
         // warmup + measured 共 4 轮，每轮独立 simulator 与夹具，保证隔离
         for (int run = 0; run < 4; run++) {
             boolean warmup = run == 0;
+            boolean last = run == 3;
             try (ModbusTcpDeviceSimulator sim = new ModbusTcpDeviceSimulator(ModbusSimulationConfig.normal())) {
                 Fixture f = new Fixture();
                 SocketPollingCollector collector = f.factory.createPollingCollector();
@@ -154,28 +159,34 @@ class ModbusPipelineBenchmarkTest {
                     long rows = f.engineRows();
                     assertTrue(attempted > 0, "异步轮询必须实际发起请求，否则测量空洞");
                     assertTrue(parsed > 0, "正常场景必须解析出合法响应");
-                    s.count("requests_attempted", attempted)
-                            .count("valid_responses_parsed", parsed)
-                            .count("persist_calls", f.persistCalls())
-                            .count("engine_rows", rows)
-                            .count("errors", Math.max(0, attempted - parsed));
+                    if (last) {
+                        s.count("requests_attempted", attempted)
+                                .count("valid_responses_parsed", parsed)
+                                .count("persist_calls", f.persistCalls())
+                                .count("engine_rows", rows)
+                                .count("errors", Math.max(0, attempted - parsed));
+                    }
                     s.addRunThroughput(parsed / (double) durationSeconds());
                 }
             }
-        }
-        // 同步回环延迟（ supplementary，非唯一指标）
-        try (ModbusTcpDeviceSimulator sim = new ModbusTcpDeviceSimulator(ModbusSimulationConfig.normal());
-             Socket socket = new Socket("127.0.0.1", sim.getPort())) {
-            Fixture f = new Fixture();
-            InputStream in = socket.getInputStream();
-            OutputStream out = socket.getOutputStream();
-            SocketPollingCollector probe = new SocketPollingCollector(f.realParser);
-            for (int i = 0; i < 200; i++) {
-                long m0 = System.nanoTime();
-                probe.pollOnce(in, out);
-                s.recordLatencyNanos(System.nanoTime() - m0);
+            // 同步回环延迟（ supplementary，非唯一指标；每轮独立连接）
+            try (ModbusTcpDeviceSimulator sim = new ModbusTcpDeviceSimulator(ModbusSimulationConfig.normal());
+                 Socket socket = new Socket("127.0.0.1", sim.getPort())) {
+                Fixture f = new Fixture();
+                InputStream in = socket.getInputStream();
+                OutputStream out = socket.getOutputStream();
+                SocketPollingCollector probe = new SocketPollingCollector(f.realParser);
+                for (int i = 0; i < 200; i++) {
+                    long m0 = System.nanoTime();
+                    probe.pollOnce(in, out);
+                    if (!warmup) {
+                        s.recordLatency("roundtrip", System.nanoTime() - m0);
+                    }
+                }
+                if (last) {
+                    s.count("sync_roundtrips", 200);
+                }
             }
-            s.count("sync_roundtrips", 200);
         }
         RECORDER.complete(s);
     }
@@ -233,45 +244,64 @@ class ModbusPipelineBenchmarkTest {
     @DisplayName("modbus-fault-disconnect-reconnect: 断开零入库，外部重连后恢复（无自动重连）")
     void modbusFaultDisconnectReconnect() throws Exception {
         BenchmarkRecorder.Scenario s = RECORDER.scenario("modbus-fault-disconnect-reconnect")
-                .note("当前 Collector 无自动重连：断开后轮询线程存活但停止消费；恢复必须由外部 connect() 触发");
-        // 阶段一：必断模拟器
-        ModbusTcpDeviceSimulator badSim =
-                new ModbusTcpDeviceSimulator(ModbusSimulationConfig.faulty(0, 1.0, 0, 0, 0));
-        Fixture f = new Fixture();
-        SocketPollingCollector collector = f.factory.createPollingCollector();
-        collector.setPollIntervalMs(5);
-        ConfigDevice device = deviceFor(badSim.getPort());
-        try {
-            collector.init(null, device, List.of(), List.of());
-            collector.connect();
-            Thread.sleep(1500);
-            long parsedDuringOutage = f.parseCount();
-            s.count("outage_parsed", parsedDuringOutage)
-                    .count("outage_engine_rows", f.engineRows())
-                    .count("simulator_disconnects", badSim.disconnects());
-            assertTrue(badSim.disconnects() > 0, "模拟器必须实际执行过断开注入");
-            assertEquals(0, parsedDuringOutage, "断开期间不得解析");
-            assertEquals(0, f.engineRows(), "断开期间不得入库");
-
-            // 阶段二：换正常模拟器 + 外部重连
-            badSim.close();
-            try (ModbusTcpDeviceSimulator goodSim =
-                         new ModbusTcpDeviceSimulator(ModbusSimulationConfig.normal())) {
-                device.getBaseInfo().setPort(goodSim.getPort());
-                long t0 = System.nanoTime();
+                .param("warmup_runs", 1)
+                .param("measured_runs", 3)
+                .param("outage_ms", 1500)
+                .note("当前 Collector 无自动重连：断开后轮询线程存活但停止消费；"
+                        + "恢复必须由外部 connect() 触发；recovery 为 connect 到首次解析的真实耗时；"
+                        + "计数器取末轮 measured 单轮值");
+        for (int run = 0; run < 4; run++) {
+            boolean warmup = run == 0;
+            boolean last = run == 3;
+            // 阶段一：必断模拟器
+            ModbusTcpDeviceSimulator badSim =
+                    new ModbusTcpDeviceSimulator(ModbusSimulationConfig.faulty(0, 1.0, 0, 0, 0));
+            Fixture f = new Fixture();
+            SocketPollingCollector collector = f.factory.createPollingCollector();
+            collector.setPollIntervalMs(5);
+            ConfigDevice device = deviceFor(badSim.getPort());
+            try {
+                collector.init(null, device, List.of(), List.of());
                 collector.connect();
-                Thread.sleep(2000);
-                long recoveryMs = (System.nanoTime() - t0) / 1_000_000L;
-                long parsedAfter = f.parseCount();
-                s.count("recovered_parsed_total", parsedAfter)
-                        .count("recovered_engine_rows", f.engineRows())
-                        .observePeak("recovery_wait_ms", recoveryMs);
-                assertTrue(parsedAfter > 0, "外部重连后必须恢复消费");
-                assertTrue(f.engineRows() > 0, "外部重连后必须恢复入库");
+                Thread.sleep(1500);
+                long parsedDuringOutage = f.parseCount();
+                if (!warmup && last) {
+                    s.count("outage_parsed", parsedDuringOutage)
+                            .count("outage_engine_rows", f.engineRows())
+                            .count("simulator_disconnects", badSim.disconnects());
+                }
+                assertTrue(badSim.disconnects() > 0, "模拟器必须实际执行过断开注入");
+                assertEquals(0, parsedDuringOutage, "断开期间不得解析");
+                assertEquals(0, f.engineRows(), "断开期间不得入库");
+
+                // 阶段二：换正常模拟器 + 外部重连，测量到首次解析的真实恢复耗时
+                badSim.close();
+                try (ModbusTcpDeviceSimulator goodSim =
+                             new ModbusTcpDeviceSimulator(ModbusSimulationConfig.normal())) {
+                    device.getBaseInfo().setPort(goodSim.getPort());
+                    long t0 = System.nanoTime();
+                    collector.connect();
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (f.parseCount() == 0 && System.currentTimeMillis() < deadline) {
+                        Thread.sleep(50);
+                    }
+                    double recoveryMs = (System.nanoTime() - t0) / 1_000_000.0;
+                    long parsedAfter = f.parseCount();
+                    if (!warmup) {
+                        s.measure("recovery", recoveryMs);
+                        if (last) {
+                            s.count("recovered_parsed_total", parsedAfter)
+                                    .count("recovered_engine_rows", f.engineRows())
+                                    .observePeak("recovery_ms_last_run", recoveryMs);
+                        }
+                    }
+                    assertTrue(parsedAfter > 0, "外部重连后必须恢复消费");
+                    assertTrue(f.engineRows() > 0, "外部重连后必须恢复入库");
+                }
+            } finally {
+                collector.close();
+                badSim.close();
             }
-        } finally {
-            collector.close();
-            badSim.close();
         }
         RECORDER.complete(s);
     }

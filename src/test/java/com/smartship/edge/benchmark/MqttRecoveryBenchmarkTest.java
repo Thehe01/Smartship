@@ -126,31 +126,47 @@ class MqttRecoveryBenchmarkTest {
                 .param("pending_rows", rows)
                 .param("batch_size", 1000)
                 .param("fail_after_rows", failAfter)
-                .note("at-least-once：失败即 break 冻结游标；恢复后从 last_uploaded_id 续查，不重扫已确认区间");
-        Fixture f = new Fixture(rows, 1000);
-        s.count("initial_backlog", f.backlog());
-        assertEquals(rows, f.backlog());
+                .param("warmup_runs", 1)
+                .param("measured_runs", 3)
+                .note("at-least-once：失败即 break 冻结游标；恢复后从 last_uploaded_id 续查，不重扫已确认区间；"
+                        + "每轮全新 H2 库 + 全新游标 + 全新网关 + 全新 poller；计数器取末轮 measured 单轮值");
+        // warmup + measured 共 4 轮，每轮完全重建，不复用数据库状态
+        for (int run = 0; run < 4; run++) {
+            boolean warmup = run == 0;
+            boolean last = run == 3;
+            Fixture f = new Fixture(rows, 1000);
+            if (!warmup && last) {
+                s.count("initial_backlog", f.backlog());
+            }
+            assertEquals(rows, f.backlog());
 
-        // 阶段一：断网
-        f.gateway.succeedFirstNThenFail(failAfter);
-        f.driveToQuiescence();
-        assertEquals(failAfter, f.cursor(), "断网后游标必须冻结在最后一个成功断点");
-        assertEquals(rows - failAfter, f.backlog(), "剩余积压必须完整保留");
-        s.count("outage_cursor", f.cursor())
-                .count("outage_backlog_peak", f.backlog());
+            // 阶段一：断网
+            f.gateway.succeedFirstNThenFail(failAfter);
+            f.driveToQuiescence();
+            assertEquals(failAfter, f.cursor(), "断网后游标必须冻结在最后一个成功断点");
+            assertEquals(rows - failAfter, f.backlog(), "剩余积压必须完整保留");
+            if (!warmup && last) {
+                s.count("outage_cursor", f.cursor())
+                        .count("outage_backlog_peak", f.backlog());
+            }
 
-        // 阶段二：恢复
-        f.gateway.alwaysSucceed();
-        int attemptsBefore = f.gateway.attempts();
-        long t0 = System.nanoTime();
-        f.driveToQuiescence();
-        long recoveryMs = (System.nanoTime() - t0) / 1_000_000L;
-        assertEquals(rows, f.cursor(), "恢复后游标必须推进到末尾");
-        assertEquals(0, f.backlog(), "恢复后积压必须归零");
-        s.count("rows_replayed", f.gateway.attempts() - attemptsBefore)
-                .count("final_cursor", f.cursor())
-                .count("final_backlog", f.backlog())
-                .observePeak("recovery_ms", recoveryMs);
+            // 阶段二：恢复
+            f.gateway.alwaysSucceed();
+            int attemptsBefore = f.gateway.attempts();
+            long t0 = System.nanoTime();
+            f.driveToQuiescence();
+            double recoveryMs = (System.nanoTime() - t0) / 1_000_000.0;
+            assertEquals(rows, f.cursor(), "恢复后游标必须推进到末尾");
+            assertEquals(0, f.backlog(), "恢复后积压必须归零");
+            if (!warmup) {
+                s.measure("recovery", recoveryMs);
+                if (last) {
+                    s.count("rows_replayed", f.gateway.attempts() - attemptsBefore)
+                            .count("final_cursor", f.cursor())
+                            .count("final_backlog", f.backlog());
+                }
+            }
+        }
         RECORDER.complete(s);
     }
 

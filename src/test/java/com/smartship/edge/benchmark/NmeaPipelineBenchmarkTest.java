@@ -112,87 +112,110 @@ class NmeaPipelineBenchmarkTest {
     }
 
     @Test
-    @DisplayName("nmea-mixed-pipeline: 混合语句直驱解析+持久化（warmup 1 + measured 3 取 median）")
-    void nmeaMixedPipeline() {
+    @DisplayName("nmea-ab: 同一确定性 dataset 的 Baseline(throttle=0) vs Throttled(throttle=3600)")
+    void nmeaAbThrottle() {
+        // 同一 dataset 复用两臂：固定 seed 生成一次，List 直接复用，不重新 Random
         NmeaSimulationConfig cfg = new NmeaSimulationConfig(
                 0, Duration.ofSeconds(60), MMSI, 0.01, 0.01);
-        BenchmarkRecorder.Scenario s = RECORDER.scenario("nmea-mixed-pipeline")
-                .param("messages_per_run", messages())
+        NmeaDeviceSimulator.GenerationResult generated =
+                new NmeaDeviceSimulator(cfg).generate(messages());
+        List<String> dataset = List.copyOf(generated.sentences());
+        int validQuota = generated.validCount();
+
+        BenchmarkRecorder.Scenario baseline = RECORDER.scenario("nmea-ab-baseline")
+                .param("messages", dataset.size())
+                .param("dataset_seed", cfg.seed())
                 .param("throttle_seconds", 0)
-                .param("noise_rate", 0.01)
-                .param("invalid_checksum_rate", 0.01)
-                .note("GPS/wind/depth 受 2000ms 内存聚合窗口门控；RSA 直写（节流 0 表示全部放行）");
+                .param("warmup_runs", 1)
+                .param("measured_runs", 3)
+                .count("input_messages", dataset.size())
+                .count("input_valid_messages", validQuota)
+                .note("同一 dataset 复用两臂；GPS/wind/depth 受 2000ms 聚合窗口门控；"
+                        + "计数器取末轮 measured 单轮值，latency/throughput 覆盖 3 轮");
+        long[] baselineRows = new long[3];
         for (int run = 0; run < 4; run++) {
             boolean warmup = run == 0;
-            NmeaDeviceSimulator sim = new NmeaDeviceSimulator(cfg);
-            NmeaDeviceSimulator.GenerationResult gen = sim.generate(messages());
-            try (Fixture f = new Fixture(0)) {
-                long t0 = System.nanoTime();
-                for (String sentence : gen.sentences()) {
-                    long m0 = System.nanoTime();
-                    f.parser.parse(sentence, "SIM");
-                    if (!warmup) {
-                        s.recordLatencyNanos(System.nanoTime() - m0);
-                    }
-                }
-                double elapsedSec = (System.nanoTime() - t0) / 1e9;
-                if (!warmup) {
-                    long valid = gen.validCount();
-                    long rows = f.rows("zncb_gps_data") + f.rows("zncb_wind_data")
-                            + f.rows("zncb_depth_data") + f.rows("zncb_rudder_data");
-                    long attempts = f.attempts("saveGps") + f.attempts("saveWind")
-                            + f.attempts("saveDepth") + f.attempts("saveRudder");
-                    s.count("input_messages", messages())
-                            .count("valid_messages", valid)
-                            .count("invalid_messages", gen.invalidCount())
-                            .count("persist_attempts", attempts)
-                            .count("persist_rows", rows)
-                            .observePeak("write_reduction_ratio",
-                                    valid == 0 ? 0.0 : 1.0 - (double) rows / valid);
-                    s.addRunThroughput(valid / elapsedSec);
+            boolean last = run == 3;
+            long[] acc = runDataset(dataset, baseline, 0, warmup);
+            if (!warmup) {
+                baselineRows[run - 1] = acc[0];
+                baseline.addRunThroughput(validQuota / (acc[2] / 1e9));
+                if (last) {
+                    baseline.count("persist_attempts", acc[1])
+                            .count("persist_rows", acc[0]);
                 }
             }
         }
-        RECORDER.complete(s);
+        RECORDER.complete(baseline);
+
+        BenchmarkRecorder.Scenario throttled = RECORDER.scenario("nmea-ab-throttled")
+                .param("messages", dataset.size())
+                .param("dataset_seed", cfg.seed())
+                .param("throttle_seconds", 3600)
+                .param("warmup_runs", 1)
+                .param("measured_runs", 3)
+                .count("input_messages", dataset.size())
+                .count("input_valid_messages", validQuota)
+                .note("input→baseline 差异含协议语义与聚合窗口影响；"
+                        + "baseline→throttled 差异才代表 PersistenceThrottle 额外削减；"
+                        + "ratio 按轮配对计算后取 median");
+        long[] throttledRows = new long[3];
+        for (int run = 0; run < 4; run++) {
+            boolean warmup = run == 0;
+            boolean last = run == 3;
+            long[] acc = runDataset(dataset, throttled, 3600, warmup);
+            if (!warmup) {
+                throttledRows[run - 1] = acc[0];
+                throttled.addRunThroughput(validQuota / (acc[2] / 1e9));
+                if (last) {
+                    throttled.count("persist_attempts", acc[1])
+                            .count("persist_rows", acc[0])
+                            .count("baseline_persist_rows", baselineRows[run - 1]);
+                }
+            }
+        }
+        int ratioPairs = 0;
+        for (int i = 0; i < 3; i++) {
+            Double ratio = BenchmarkRecorder.throttleReductionRatio(baselineRows[i], throttledRows[i]);
+            if (ratio != null) {
+                throttled.measure("throttle_write_reduction_ratio", ratio);
+                ratioPairs++;
+            }
+        }
+        if (ratioPairs == 0) {
+            throttled.note("throttle_write_reduction_ratio: N/A（baseline_rows == 0）");
+        }
+        RECORDER.complete(throttled);
+        // 口径断言：节流臂入库数不得超过基线臂（同 dataset 下单调性）
+        for (int i = 0; i < 3; i++) {
+            assertTrue(throttledRows[i] <= baselineRows[i],
+                    "同 dataset 下 throttled_rows 必须 <= baseline_rows");
+        }
     }
 
-    @Test
-    @DisplayName("nmea-throttle-effect: 长节流窗口下的实际写入削减（实测计算）")
-    void nmeaThrottleEffect() {
-        NmeaSimulationConfig cfg = new NmeaSimulationConfig(
-                0, Duration.ofSeconds(60), MMSI, 0.0, 0.0);
-        BenchmarkRecorder.Scenario s = RECORDER.scenario("nmea-throttle-effect")
-                .param("messages_per_run", messages())
-                .param("throttle_seconds", 3600)
-                .note("节流键按 mmsi:stream 聚合，3600s 窗口下每流首条放行；比例由实测行数/有效输入计算");
-        for (int run = 0; run < 4; run++) {
-            boolean warmup = run == 0;
-            NmeaDeviceSimulator sim = new NmeaDeviceSimulator(cfg);
-            NmeaDeviceSimulator.GenerationResult gen = sim.generate(messages());
-            try (Fixture f = new Fixture(3600)) {
-                long t0 = System.nanoTime();
-                for (String sentence : gen.sentences()) {
-                    long m0 = System.nanoTime();
-                    f.parser.parse(sentence, "SIM");
-                    if (!warmup) {
-                        s.recordLatencyNanos(System.nanoTime() - m0);
-                    }
-                }
-                double elapsedSec = (System.nanoTime() - t0) / 1e9;
+    /**
+     * 用全新夹具跑一遍 dataset。
+     *
+     * @return {persistRows, persistAttempts, elapsedNanos}
+     */
+    private static long[] runDataset(List<String> dataset, BenchmarkRecorder.Scenario s,
+                                     int throttleSeconds, boolean warmup) {
+        try (Fixture f = new Fixture(throttleSeconds)) {
+            long t0 = System.nanoTime();
+            for (String sentence : dataset) {
+                long m0 = System.nanoTime();
+                f.parser.parse(sentence, "SIM");
                 if (!warmup) {
-                    long valid = gen.validCount();
-                    long rows = f.rows("zncb_gps_data") + f.rows("zncb_wind_data")
-                            + f.rows("zncb_depth_data") + f.rows("zncb_rudder_data");
-                    s.count("input_messages", messages())
-                            .count("valid_messages", valid)
-                            .count("persist_rows", rows)
-                            .observePeak("write_reduction_ratio",
-                                    valid == 0 ? 0.0 : 1.0 - (double) rows / valid);
-                    s.addRunThroughput(valid / elapsedSec);
+                    s.recordLatency("parse", System.nanoTime() - m0);
                 }
             }
+            long elapsed = System.nanoTime() - t0;
+            long rows = f.rows("zncb_gps_data") + f.rows("zncb_wind_data")
+                    + f.rows("zncb_depth_data") + f.rows("zncb_rudder_data");
+            long attempts = f.attempts("saveGps") + f.attempts("saveWind")
+                    + f.attempts("saveDepth") + f.attempts("saveRudder");
+            return new long[]{rows, attempts, elapsed};
         }
-        RECORDER.complete(s);
     }
 
     @Test
@@ -210,6 +233,7 @@ class NmeaPipelineBenchmarkTest {
                 .note("服务端逐行读取真实 TCP 流并 parse；坏校验语句必须零入库");
         for (int run = 0; run < 4; run++) {
             boolean warmup = run == 0;
+            boolean last = run == 3;
             try (Fixture f = new Fixture(0);
                  ServerSocket server = new ServerSocket(0, 50,
                          java.net.InetAddress.getByName("127.0.0.1"))) {
@@ -245,16 +269,20 @@ class NmeaPipelineBenchmarkTest {
                     }
                 }
                 assertTrue(done.await(30, TimeUnit.SECONDS), "TCP 流必须在 30s 内消费完毕");
+                reader.join(5000);
+                assertFalse(reader.isAlive(), "reader 线程必须在流结束后退出，不得仅依赖 daemon");
                 double elapsedSec = (System.nanoTime() - t0) / 1e9;
                 if (!warmup) {
-                    s.count("input_messages", count)
-                            .count("received_lines", received.get())
-                            .count("valid_messages", gen.validCount())
-                            .count("invalid_messages", gen.invalidCount())
-                            .count("persist_rows", f.rows("zncb_gps_data") + f.rows("zncb_wind_data")
-                                    + f.rows("zncb_depth_data") + f.rows("zncb_rudder_data"));
+                    if (last) {
+                        s.count("input_messages", count)
+                                .count("received_lines", received.get())
+                                .count("valid_messages", gen.validCount())
+                                .count("invalid_messages", gen.invalidCount())
+                                .count("persist_rows", f.rows("zncb_gps_data") + f.rows("zncb_wind_data")
+                                        + f.rows("zncb_depth_data") + f.rows("zncb_rudder_data"));
+                    }
                     for (long nanos : lineNanos) {
-                        s.recordLatencyNanos(nanos);
+                        s.recordLatency("parse", nanos);
                     }
                     s.addRunThroughput(received.get() / elapsedSec);
                 }
