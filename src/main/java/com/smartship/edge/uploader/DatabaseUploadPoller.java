@@ -90,7 +90,15 @@ public class DatabaseUploadPoller {
             return;
         }
 
-        for (ShipDataSourceManager.ShipDatabase ship : shipDataSourceManager.listEnabledRegistries()) {
+        List<ShipDataSourceManager.ShipDatabase> ships;
+        try {
+            ships = shipDataSourceManager.listEnabledRegistries();
+        } catch (Exception e) {
+            log.warn("[Uploader] 获取可用船舶列表异常: {}", e.getMessage());
+            ships = List.of();
+        }
+
+        for (ShipDataSourceManager.ShipDatabase ship : ships) {
             try {
                 JdbcTemplate jdbcTemplate = shipDataSourceManager.getJdbcTemplate(ship.shipId(), ship.mmsi());
                 ensureCursorTable(jdbcTemplate);

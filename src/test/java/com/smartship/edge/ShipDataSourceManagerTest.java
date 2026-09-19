@@ -911,4 +911,28 @@ class ShipDataSourceManagerTest {
         // 8. pool count 全局保持为 1
         assertEquals(1, manager.listPoolSnapshots().size(), "连接池总数依然为 1，无资源泄漏");
     }
+
+    @Test
+    @DisplayName("测试场景 26: listEnabledRegistries 语义验证（正常返回启用列表、无启用返回空列表、DB故障抛出 RegistryQueryException）")
+    void testListEnabledRegistriesSemantics() {
+        // 初始状态：插入一个启用和一个禁用的船舶
+        insertShip("ship-en", "413111111", "zncb_ship_en", "jdbc:h2:mem:ship_en;DB_CLOSE_DELAY=-1", 0, "sa", "", true);
+        insertShip("ship-dis", "413222222", "zncb_ship_dis", "jdbc:h2:mem:ship_dis;DB_CLOSE_DELAY=-1", 0, "sa", "", false);
+
+        // 1. 正常查询：只返回 enabled = 1 的船舶
+        List<ShipDataSourceManager.ShipDatabase> enabledList = manager.listEnabledRegistries();
+        assertEquals(1, enabledList.size());
+        assertEquals("413111111", enabledList.get(0).mmsi());
+
+        // 2. 将启用的船舶也禁用：SQL 正常执行，但无启用船舶 -> 返回空列表，不抛异常
+        authJdbcTemplate.update("UPDATE ship_database_registry SET enabled = 0");
+        List<ShipDataSourceManager.ShipDatabase> emptyList = manager.listEnabledRegistries();
+        assertNotNull(emptyList);
+        assertTrue(emptyList.isEmpty(), "无启用船舶时必须正常返回空列表");
+
+        // 3. 破坏认证库表结构模拟数据库异常 -> 必须抛出 RegistryQueryException
+        authJdbcTemplate.execute("DROP TABLE ship_database_registry");
+        assertThrows(RegistryQueryException.class, () -> manager.listEnabledRegistries(),
+                "数据库异常时必须抛出 RegistryQueryException，严禁掩盖为普通空列表");
+    }
 }

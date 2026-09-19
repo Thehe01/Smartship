@@ -491,6 +491,10 @@ public class ShipDataSourceManager {
 
     /**
      * 查询所有已启用的船舶注册配置
+     * <p>
+     * 明确异常语义：
+     * - SQL 正常执行但无启用船舶：返回空列表 List.of()
+     * - 数据库/网络/SQL 执行异常：抛出 RegistryQueryException，杜绝误判为正常无数据
      */
     public List<ShipDatabase> listEnabledRegistries() {
         try {
@@ -509,9 +513,12 @@ public class ShipDataSourceManager {
                             firstText(rs.getString("username"), properties.getDatasource().getShip().getDefaultUsername()),
                             firstText(rs.getString("password"), properties.getDatasource().getShip().getDefaultPassword()),
                             rs.getBoolean("enabled")));
+        } catch (DataAccessException e) {
+            log.error("[ShipDB] 查询可用船舶注册表异常: error={}", e.getMessage());
+            throw new RegistryQueryException("Failed to query enabled ship registries: " + e.getMessage(), e);
         } catch (Exception e) {
-            log.warn("[ShipDB] 列出可用船舶失败: {}", e.getMessage());
-            return List.of();
+            log.error("[ShipDB] 查询可用船舶注册表未知异常: error={}", e.getMessage());
+            throw new RegistryQueryException("Unexpected error querying enabled ship registries: " + e.getMessage(), e);
         }
     }
 

@@ -392,26 +392,58 @@ public class ObservabilityMetricsTest {
 
         Gauge backlogGauge = registry.find("smartship_uploader_backlog_rows").gauge();
         assertNotNull(backlogGauge);
-        assertEquals(6.0, backlogGauge.value(), "初始 backlog 应为 10 - 4 = 6");
 
-        // 关键断言：当非零积压 (6.0) 下发生表查询异常（如超时/连接中断），绝不错误归零，坚决保留 6.0
+        // 初始采样前，Gauge 仅读取内存初始值 0
+        assertEquals(0.0, backlogGauge.value());
+
+        // 首次显式采样：maxId = 10, cursor = 4 -> backlog = 6
+        backlogMetrics.refresh();
+        assertEquals(6.0, backlogGauge.value(), "初始采样后 backlog 应为 10 - 4 = 6");
+
+        // 关键断言：当非零积压 (6.0) 下发生表查询异常（如超时/连接中断），采样失败，绝不错误归零，坚决保留 6.0
         JdbcTemplate failingQueryJt = mock(JdbcTemplate.class);
         when(failingQueryJt.queryForObject(contains("zncb_gps_data"), eq(Long.class)))
                 .thenThrow(new org.springframework.dao.QueryTimeoutException("DB timeout"));
         when(manager.getJdbcTemplate("s1", "413999999")).thenReturn(failingQueryJt);
+        backlogMetrics.refresh();
         assertEquals(6.0, backlogGauge.value(), "表查询异常时绝不能错误将 backlog 归零，必须保留历史值 6.0");
 
         // 恢复正常 Template
         when(manager.getJdbcTemplate("s1", "413999999")).thenReturn(jt);
+        backlogMetrics.refresh();
         assertEquals(6.0, backlogGauge.value());
 
-        // 推进 cursor 至 10 -> backlog 应为 0
+        // 推进 cursor 至 10 -> 采样后 backlog 应为 0
         jt.execute("UPDATE zncb_upload_cursor SET last_uploaded_id = 10 WHERE stream_name = 'zncb_gps_data'");
+        backlogMetrics.refresh();
         assertEquals(0.0, backlogGauge.value());
 
         // 模拟数据源管理器抛出异常时同样安全保留历史值
         when(manager.getJdbcTemplate("s1", "413999999")).thenThrow(new RuntimeException("Connection lost"));
+        backlogMetrics.refresh();
         assertEquals(0.0, backlogGauge.value());
+    }
+
+    @Test
+    @DisplayName("测试场景 9: Prometheus scrape 必须无副作用，读取 backlog Gauge 严禁触发任何数据库查询")
+    void testPrometheusScrapeDoesNotQueryBusinessDatabase() {
+        ShipDataSourceManager manager = mock(ShipDataSourceManager.class);
+        UploadBacklogMetrics backlogMetrics = new UploadBacklogMetrics(manager);
+        backlogMetrics.bindTo(registry);
+
+        Gauge backlogGauge = registry.find("smartship_uploader_backlog_rows").gauge();
+        assertNotNull(backlogGauge);
+
+        // 多次触发 scrape 动作
+        for (int i = 0; i < 5; i++) {
+            double val = backlogGauge.value();
+            assertEquals(0.0, val);
+        }
+
+        // 严格验证：Prometheus 抓取时只读取内存状态，绝对不调用 listEnabledRegistries / getJdbcTemplate / listPoolSnapshots
+        verify(manager, never()).listEnabledRegistries();
+        verify(manager, never()).getJdbcTemplate(any(), any());
+        verify(manager, never()).listPoolSnapshots();
     }
 
     @Test

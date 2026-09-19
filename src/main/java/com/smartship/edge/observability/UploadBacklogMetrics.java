@@ -44,7 +44,6 @@ public class UploadBacklogMetrics implements MeterBinder {
     }
 
     public long getBacklogRows() {
-        refresh();
         return lastKnownBacklog.get();
     }
 
@@ -52,27 +51,22 @@ public class UploadBacklogMetrics implements MeterBinder {
         try {
             List<ShipDataSourceManager.ShipDatabase> ships = shipDataSourceManager.listEnabledRegistries();
             if (ships.isEmpty()) {
-                // 若存在活跃连接池但可用船舶列表为空，疑似主认证库查询异常，保留历史值防闪烁
-                if (!shipDataSourceManager.listPoolSnapshots().isEmpty()) {
-                    log.warn("[Observability] 存在活跃连接池但可用船舶列表为空，疑似主认证库异常，保留历史 backlog: {}",
-                            lastKnownBacklog.get());
-                    return;
-                }
                 lastKnownBacklog.set(0L);
                 return;
             }
 
-            long totalBacklog = 0L;
+            long sampledBacklog = 0L;
             for (ShipDataSourceManager.ShipDatabase ship : ships) {
                 JdbcTemplate jt = shipDataSourceManager.getJdbcTemplate(ship.shipId(), ship.mmsi());
                 for (String table : TELEMETRY_TABLES) {
-                    totalBacklog += calculateTableBacklog(jt, table);
+                    sampledBacklog += calculateTableBacklog(jt, table);
                 }
             }
-            lastKnownBacklog.set(totalBacklog);
+            lastKnownBacklog.set(sampledBacklog);
+        } catch (com.smartship.edge.routing.exception.RegistryQueryException e) {
+            log.warn("[Observability] 船舶注册库查询异常，保留上一轮 backlog {}: {}", lastKnownBacklog.get(), e.getMessage());
         } catch (Exception e) {
-            log.warn("[Observability] 计算上传 backlog 异常，保留历史值 {}: {}", lastKnownBacklog.get(), e.getMessage());
-            // 保留最近一次成功采集值，绝不将 backlog 错误归零
+            log.warn("[Observability] 计算上传 backlog 异常，保留上一轮 backlog {}: {}", lastKnownBacklog.get(), e.getMessage());
         }
     }
 

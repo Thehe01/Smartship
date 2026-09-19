@@ -1,5 +1,6 @@
 package com.smartship.edge.collector;
 
+import com.smartship.edge.collect.modbus.ModbusParser;
 import com.smartship.edge.collect.modbus.tcp.ModbusTcpCodec;
 import com.smartship.edge.collect.modbus.tcp.ModbusTcpRequest;
 import com.smartship.edge.collect.modbus.tcp.ModbusTcpResponse;
@@ -22,6 +23,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 1. 每轮请求动态自增 Transaction ID，实现严格的请求-响应事务级匹配校验（Transaction ID + Unit ID + Function Code）
  * 2. 基于 MBAP Header Length 契约流式分包，利用 readFully 消除 TCP 半包与粘包
  * 3. 异步通过有界阻塞队列（容量 100）解耦网络 I/O 与业务解算线程，形成天然背压
+ * 4. 接入 ModbusParser，打通 Modbus TCP -> Parser -> DataHandler -> Persistence 业务闭环
  */
 public class SocketPollingCollector extends AbstractSocketCollector {
 
@@ -31,7 +33,15 @@ public class SocketPollingCollector extends AbstractSocketCollector {
     private int quantity = 16;
     private long pollIntervalMs = 1000L;
 
+    private ModbusParser modbusParser;
     private final BlockingQueue<ModbusTcpResponse> responseQueue = new LinkedBlockingQueue<>(100);
+
+    public SocketPollingCollector() {
+    }
+
+    public SocketPollingCollector(ModbusParser modbusParser) {
+        this.modbusParser = modbusParser;
+    }
 
     @Override
     protected String getCollectorName() {
@@ -42,6 +52,11 @@ public class SocketPollingCollector extends AbstractSocketCollector {
     public void init(ICollectService collectService, ConfigDevice device, List<ConfigVariable> variables, List<ConfigAlarm> alarms) {
         super.init(collectService, device, variables, alarms);
         startTimeoutWatchdog(10000L);
+    }
+
+    public void init(ICollectService collectService, ConfigDevice device, List<ConfigVariable> variables, List<ConfigAlarm> alarms, ModbusParser modbusParser) {
+        this.modbusParser = modbusParser;
+        init(collectService, device, variables, alarms);
     }
 
     @Override
@@ -55,32 +70,17 @@ public class SocketPollingCollector extends AbstractSocketCollector {
                         continue;
                     }
 
-                    // 每轮请求动态自增生成 Transaction ID，确保请求与响应严格关联闭环
-                    int txId = transactionCounter.getAndIncrement() & 0xFFFF;
-                    ModbusTcpRequest request = ModbusTcpRequest.readHoldingRegisters(txId, unitId, startAddress, quantity);
-
                     OutputStream outputStream = this.socket.getOutputStream();
-                    outputStream.write(ModbusTcpCodec.encodeRequest(request));
-                    outputStream.flush();
-
                     InputStream inputStream = this.socket.getInputStream();
-                    // 基于 MBAP Header 中声明的 Length 字段，利用 readFully 消除 TCP 粘包半包
-                    byte[] frame = ModbusTcpCodec.readFrame(inputStream);
-                    if (frame == null) {
+                    ModbusTcpResponse response = pollOnce(inputStream, outputStream);
+                    if (response == null) {
                         log.warn("[Socket-Polling] 设备: {} 连接被对端断开", getDeviceName());
                         this.connect = false;
                         closeSocketQuietly();
                         continue;
                     }
 
-                    ModbusTcpResponse response = ModbusTcpCodec.decodeResponse(frame);
-
-                    // 严格校验响应报文与发起请求的事务一致性（Transaction ID, Unit ID, Function Code）
-                    ModbusTcpCodec.validateResponse(request, response);
-
-                    this.lastDataTime = System.currentTimeMillis();
                     this.responseQueue.put(response);
-
                     Thread.sleep(pollIntervalMs);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -98,13 +98,7 @@ public class SocketPollingCollector extends AbstractSocketCollector {
             while (this.running && !Thread.currentThread().isInterrupted()) {
                 try {
                     ModbusTcpResponse response = this.responseQueue.take();
-                    if (response.isException()) {
-                        log.warn("[Socket-Polling] 设备: {} 收到 Modbus 异常响应: 功能码 0x{}, 异常码 0x{}",
-                                getDeviceName(), Integer.toHexString(response.functionCode()), Integer.toHexString(response.exceptionCode()));
-                    } else if (response.registers().length > 0) {
-                        log.debug("[Socket-Polling] 设备: {} 从站: {} 成功解出 {} 个寄存器数值",
-                                getDeviceName(), response.unitId(), response.registers().length);
-                    }
+                    processResponse(response);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
@@ -115,7 +109,95 @@ public class SocketPollingCollector extends AbstractSocketCollector {
         });
     }
 
+    /**
+     * 单次读轮询与事务协议校验
+     */
+    public ModbusTcpResponse pollOnce(InputStream inputStream, OutputStream outputStream) throws Exception {
+        int txId = transactionCounter.getAndIncrement() & 0xFFFF;
+        ModbusTcpRequest request = ModbusTcpRequest.readHoldingRegisters(txId, unitId, startAddress, quantity);
+
+        outputStream.write(ModbusTcpCodec.encodeRequest(request));
+        outputStream.flush();
+
+        byte[] frame = ModbusTcpCodec.readFrame(inputStream);
+        if (frame == null) {
+            return null;
+        }
+
+        ModbusTcpResponse response = ModbusTcpCodec.decodeResponse(frame);
+        // 严格校验响应报文与发起请求的事务一致性（Transaction ID, Unit ID, Function Code）
+        ModbusTcpCodec.validateResponse(request, response);
+
+        this.lastDataTime = System.currentTimeMillis();
+        return response;
+    }
+
+    /**
+     * 处理经过事务校验的响应
+     * 异常响应严禁调用 ModbusParser 与持久化
+     */
+    public void processResponse(ModbusTcpResponse response) {
+        if (response == null) {
+            return;
+        }
+        if (response.isException()) {
+            log.warn("[Socket-Polling] 设备: {} 收到 Modbus 异常响应: 功能码 0x{}, 异常码 0x{}",
+                    getDeviceName(), Integer.toHexString(response.functionCode()), Integer.toHexString(response.exceptionCode()));
+            return;
+        }
+        if (modbusParser != null) {
+            modbusParser.parse(response.unitId(), response.pdu());
+        } else if (response.registers().length > 0) {
+            log.debug("[Socket-Polling] 设备: {} 从站: {} 成功解出 {} 个寄存器数值",
+                    getDeviceName(), response.unitId(), response.registers().length);
+        }
+    }
+
     public int getTransactionCount() {
         return transactionCounter.get();
+    }
+
+    public ModbusParser getModbusParser() {
+        return modbusParser;
+    }
+
+    public void setModbusParser(ModbusParser modbusParser) {
+        this.modbusParser = modbusParser;
+    }
+
+    public BlockingQueue<ModbusTcpResponse> getResponseQueue() {
+        return responseQueue;
+    }
+
+    public int getUnitId() {
+        return unitId;
+    }
+
+    public void setUnitId(int unitId) {
+        this.unitId = unitId;
+    }
+
+    public int getStartAddress() {
+        return startAddress;
+    }
+
+    public void setStartAddress(int startAddress) {
+        this.startAddress = startAddress;
+    }
+
+    public int getQuantity() {
+        return quantity;
+    }
+
+    public void setQuantity(int quantity) {
+        this.quantity = quantity;
+    }
+
+    public long getPollIntervalMs() {
+        return pollIntervalMs;
+    }
+
+    public void setPollIntervalMs(long pollIntervalMs) {
+        this.pollIntervalMs = pollIntervalMs;
     }
 }

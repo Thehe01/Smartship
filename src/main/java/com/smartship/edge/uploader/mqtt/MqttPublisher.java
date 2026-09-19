@@ -45,7 +45,13 @@ public class MqttPublisher {
         payload.put("mmsi", mmsi);
         payload.put("type", type);
         payload.put("msg_id", stableMessageId(mmsi, type, row));
-        payload.put("timestamp", ZonedDateTime.now(ZoneOffset.ofHours(8)).format(TIME_FMT));
+        // 原始 row 存在业务事件时间则原样保留，绝不覆盖；不存在时不伪造
+        if (row.containsKey("timestamp") && row.get("timestamp") != null) {
+            payload.put("timestamp", row.get("timestamp"));
+        } else {
+            payload.remove("timestamp");
+        }
+        payload.put("sent_at", ZonedDateTime.now(ZoneOffset.ofHours(8)).format(TIME_FMT));
 
         try {
             String topic = "zncb/" + mmsi + "/" + topicSuffix;
