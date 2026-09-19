@@ -60,9 +60,12 @@ public class ShipAutoRegisterService {
 
     private void executeSerialDataSchema(JdbcTemplate jt) {
         try {
-            ClassPathResource resource = new ClassPathResource("schema/serialdata-schema.sql");
+            ClassPathResource resource = new ClassPathResource("schema/ship-schema.sql");
             if (!resource.exists()) {
-                log.warn("[AutoRegister] 未找到 schema/serialdata-schema.sql，跳过表结构初始化");
+                resource = new ClassPathResource("schema/serialdata-schema.sql");
+            }
+            if (!resource.exists()) {
+                log.warn("[AutoRegister] 未找到 schema/ship-schema.sql，跳过表结构初始化");
                 return;
             }
             String sql = new String(resource.getInputStream().readAllBytes(), StandardCharsets.UTF_8);

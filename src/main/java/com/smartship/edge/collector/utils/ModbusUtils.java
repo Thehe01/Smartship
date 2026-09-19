@@ -7,6 +7,12 @@ import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * Modbus RTU / 串口通信辅助工具类
+ * <p>
+ * 注意：此类专用于 Modbus RTU 串行总线协议（采用 CRC16 校验尾）。
+ * 若使用以太网 Modbus TCP 通信，请使用 {@link com.smartship.edge.collect.modbus.tcp.ModbusTcpCodec}。
+ */
 public class ModbusUtils {
     private static final Logger log = LoggerFactory.getLogger(ModbusUtils.class);
 
@@ -14,7 +20,7 @@ public class ModbusUtils {
     }
 
     /**
-     * 构建 Modbus 读寄存器请求帧（含 CRC 校验）
+     * 构建 Modbus RTU 读寄存器请求帧（含 CRC16 尾校验）
      */
     public static byte[] buildReadRequest(int slaveId, int startReg, int regCount, int functionCode) {
         ByteArrayOutputStream output = new ByteArrayOutputStream();

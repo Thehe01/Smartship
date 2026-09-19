@@ -60,8 +60,16 @@ public class MqttPublisher {
      */
     public static String stableMessageId(String mmsi, String type, Map<String, Object> row) {
         String sourceIdentity = first(row, "source_id", "external_alarm_id", "local_id", "id", "device_code");
-        String sourceTime = first(row, "update_time", "updated_at", "rec_time", "alarm_time", "time", "timestamp");
-        String canonical = mmsi + "|" + type + "|" + sourceIdentity + "|" + sourceTime;
+        String sourceTime = first(row, "update_time", "updated_at", "rec_time", "alarm_time", "time", "timestamp", "create_time");
+        
+        String canonical;
+        if ("unknown".equals(sourceIdentity) && "unknown".equals(sourceTime)) {
+            // 兜底防撞：若无显式主键与时间戳，以有序载荷内容为指纹基准，杜绝不同快照碰撞同一 msg_id
+            canonical = mmsi + "|" + type + "|payload:" + row;
+        } else {
+            canonical = mmsi + "|" + type + "|" + sourceIdentity + "|" + sourceTime;
+        }
+
         try {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
                     .digest(canonical.getBytes(StandardCharsets.UTF_8)));

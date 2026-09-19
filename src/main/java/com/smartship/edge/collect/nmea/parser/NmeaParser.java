@@ -42,6 +42,8 @@ public class NmeaParser {
         if (properties.getMmsi() != null && !properties.getMmsi().isBlank()) {
             staticConfiguredMmsi = properties.getMmsi().trim();
             log.info("[NMEA] 静态 MMSI 配置锁定: {}", staticConfiguredMmsi);
+            // 确保静态配置 MMSI 启动时立即向注册表登记并就绪目标船库结构 (置位 schemaReady = true)
+            shipAutoRegisterService.ensureRegistered(staticConfiguredMmsi);
         } else {
             // 尝试读取上次断电前持久化的本船 MMSI
             String cached = MmsiPersistence.read();

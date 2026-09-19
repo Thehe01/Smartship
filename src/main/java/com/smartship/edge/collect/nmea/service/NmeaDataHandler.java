@@ -2,12 +2,10 @@ package com.smartship.edge.collect.nmea.service;
 
 import com.smartship.edge.routing.PersistenceThrottle;
 import com.smartship.edge.routing.service.NmeaDataPersistenceService;
-import com.smartship.edge.uploader.mqtt.MqttPublisher;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -25,7 +23,6 @@ import java.util.concurrent.atomic.AtomicLong;
 public class NmeaDataHandler {
 
     private final NmeaDataPersistenceService persistence;
-    private final MqttPublisher mqttPublisher;
     private final PersistenceThrottle throttle;
 
     private final Object gpsLock = new Object();
@@ -164,7 +161,7 @@ public class NmeaDataHandler {
             }
         }
         if (snapshot != null) {
-            // [模块三] CAS 写入节流保护
+            // [模块三] CAS 写入节流保护，异步写入分船库
             if (throttle.shouldWrite(snapshot.mmsi() + ":nmea:gps")) {
                 persistence.saveGps("FRAME", source,
                         snapshot.lat(), snapshot.lon(), snapshot.speed(), snapshot.course(),
@@ -172,14 +169,6 @@ public class NmeaDataHandler {
                         snapshot.altitude(), snapshot.satellites(), snapshot.hdop(),
                         snapshot.quality(), snapshot.status(), snapshot.mmsi());
             }
-            // 实时双发到云端
-            mqttPublisher.publish(snapshot.mmsi(), "nmea_gps", "nmea_gps", Map.of(
-                    "latitude", snapshot.lat() != null ? snapshot.lat() : 0,
-                    "longitude", snapshot.lon() != null ? snapshot.lon() : 0,
-                    "speed", snapshot.speed() != null ? snapshot.speed() : 0,
-                    "course", snapshot.course() != null ? snapshot.course() : 0,
-                    "heading_true", snapshot.headingTrue() != null ? snapshot.headingTrue() : 0
-            ));
         }
     }
 
