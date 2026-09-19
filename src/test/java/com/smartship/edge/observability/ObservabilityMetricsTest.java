@@ -394,13 +394,23 @@ public class ObservabilityMetricsTest {
         assertNotNull(backlogGauge);
         assertEquals(6.0, backlogGauge.value(), "初始 backlog 应为 10 - 4 = 6");
 
+        // 关键断言：当非零积压 (6.0) 下发生表查询异常（如超时/连接中断），绝不错误归零，坚决保留 6.0
+        JdbcTemplate failingQueryJt = mock(JdbcTemplate.class);
+        when(failingQueryJt.queryForObject(contains("zncb_gps_data"), eq(Long.class)))
+                .thenThrow(new org.springframework.dao.QueryTimeoutException("DB timeout"));
+        when(manager.getJdbcTemplate("s1", "413999999")).thenReturn(failingQueryJt);
+        assertEquals(6.0, backlogGauge.value(), "表查询异常时绝不能错误将 backlog 归零，必须保留历史值 6.0");
+
+        // 恢复正常 Template
+        when(manager.getJdbcTemplate("s1", "413999999")).thenReturn(jt);
+        assertEquals(6.0, backlogGauge.value());
+
         // 推进 cursor 至 10 -> backlog 应为 0
         jt.execute("UPDATE zncb_upload_cursor SET last_uploaded_id = 10 WHERE stream_name = 'zncb_gps_data'");
         assertEquals(0.0, backlogGauge.value());
 
-        // 模拟异常时保留历史值
+        // 模拟数据源管理器抛出异常时同样安全保留历史值
         when(manager.getJdbcTemplate("s1", "413999999")).thenThrow(new RuntimeException("Connection lost"));
-        // 再次获取应保留上一次的 0.0，绝不崩溃
         assertEquals(0.0, backlogGauge.value());
     }
 

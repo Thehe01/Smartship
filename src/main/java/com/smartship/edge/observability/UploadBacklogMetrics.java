@@ -6,6 +6,7 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.binder.MeterBinder;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.jdbc.BadSqlGrammarException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
 
@@ -51,6 +52,12 @@ public class UploadBacklogMetrics implements MeterBinder {
         try {
             List<ShipDataSourceManager.ShipDatabase> ships = shipDataSourceManager.listEnabledRegistries();
             if (ships.isEmpty()) {
+                // 若存在活跃连接池但可用船舶列表为空，疑似主认证库查询异常，保留历史值防闪烁
+                if (!shipDataSourceManager.listPoolSnapshots().isEmpty()) {
+                    log.warn("[Observability] 存在活跃连接池但可用船舶列表为空，疑似主认证库异常，保留历史 backlog: {}",
+                            lastKnownBacklog.get());
+                    return;
+                }
                 lastKnownBacklog.set(0L);
                 return;
             }
@@ -77,8 +84,9 @@ public class UploadBacklogMetrics implements MeterBinder {
             }
             long lastId = queryCursorId(jt, table);
             return Math.max(0L, maxId - lastId);
-        } catch (Exception e) {
-            log.debug("[Observability] 查询表 {} backlog 降级: {}", table, e.getMessage());
+        } catch (BadSqlGrammarException e) {
+            // 表尚未就绪/不存在，积压视为 0
+            log.debug("[Observability] 表 {} 尚未就绪，积压视为 0: {}", table, e.getMessage());
             return 0L;
         }
     }
@@ -91,7 +99,8 @@ public class UploadBacklogMetrics implements MeterBinder {
                     table
             );
             return results.isEmpty() ? 0L : results.get(0);
-        } catch (Exception e) {
+        } catch (BadSqlGrammarException e) {
+            // 游标表尚未初始化/不存在，视为从未上传（游标为 0）
             return 0L;
         }
     }

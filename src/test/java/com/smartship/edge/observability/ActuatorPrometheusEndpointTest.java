@@ -70,6 +70,8 @@ public class ActuatorPrometheusEndpointTest {
                 "Prometheus 必须暴露 smartship_persistence_pool_size");
         assertTrue(body.contains("smartship_persistence_pool_queue_size"),
                 "Prometheus 必须暴露 smartship_persistence_pool_queue_size");
+        assertTrue(body.contains("smartship_persistence_pool_queue_remaining"),
+                "Prometheus 必须暴露 smartship_persistence_pool_queue_remaining");
         assertTrue(body.contains("smartship_persistence_pool_completed_tasks"),
                 "Prometheus 必须暴露 smartship_persistence_pool_completed_tasks");
         assertTrue(body.contains("smartship_persistence_pool_rejections"),
@@ -91,7 +93,9 @@ public class ActuatorPrometheusEndpointTest {
         assertTrue(body.contains("smartship_persistence_writes_total"),
                 "Prometheus 必须暴露 smartship_persistence_writes_total");
         assertTrue(body.contains("type=\"gps\""), "标签 type 必须包含 gps");
+        assertTrue(body.contains("type=\"wind\""), "标签 type 必须包含 wind");
         assertTrue(body.contains("result=\"success\""), "标签 result 必须包含 success");
+        assertTrue(body.contains("result=\"failure\""), "标签 result 必须包含 failure");
         assertTrue(body.contains("smartship_persistence_write_duration_seconds"),
                 "Prometheus 必须暴露 smartship_persistence_write_duration_seconds");
 
@@ -108,6 +112,7 @@ public class ActuatorPrometheusEndpointTest {
         // 验证 Uploader 指标
         assertTrue(body.contains("smartship_uploader_rows_total"),
                 "Prometheus 必须暴露 smartship_uploader_rows_total");
+        assertTrue(body.contains("stream=\"gps\""), "标签 stream 必须包含 gps");
         assertTrue(body.contains("smartship_uploader_batches_total"),
                 "Prometheus 必须暴露 smartship_uploader_batches_total");
         assertTrue(body.contains("smartship_uploader_backlog_rows"),

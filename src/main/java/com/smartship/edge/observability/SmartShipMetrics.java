@@ -102,6 +102,9 @@ public class SmartShipMetrics {
     // ================= Uploader 指标 =================
 
     public void recordUploadRows(String stream, boolean success, long count) {
+        if (count <= 0) {
+            return;
+        }
         String cleanStream = normalizeType(stream);
         getOrCreateCounter("smartship_uploader_rows_total", "stream", cleanStream, "result", success ? "success" : "failure")
                 .increment(count);
