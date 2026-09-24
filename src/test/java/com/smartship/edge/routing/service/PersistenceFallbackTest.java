@@ -121,4 +121,68 @@ class PersistenceFallbackTest {
         assertEquals(1.0, counter("smartship_persistence_fallback_total",
                 "type", "depth").count());
     }
+
+    @Test
+    @DisplayName("批量路径：连接都拿不到时整批进三级兜底，不静默丢失")
+    void batchFallbackWhenConnectionUnavailable() throws Exception {
+        JdbcTemplate jt = mock(JdbcTemplate.class);
+        javax.sql.DataSource ds = mock(javax.sql.DataSource.class);
+        when(jt.getDataSource()).thenReturn(ds);
+        when(ds.getConnection()).thenThrow(new java.sql.SQLException("MySQL down"));
+        when(jt.update(org.mockito.ArgumentMatchers.argThat(
+                (String sql) -> sql != null && sql.contains("zncb_failed_writes")),
+                any(Object[].class))).thenReturn(1);
+
+        com.smartship.edge.persist.FileFallbackStore store =
+                mock(com.smartship.edge.persist.FileFallbackStore.class);
+        NmeaDataPersistenceService service =
+                new NmeaDataPersistenceService(jt, properties, null, metrics, store);
+        java.util.List<EnginePoint> batch = java.util.List.of(
+                EnginePoint.now("413999999", 1, 1500.0, 85.0, 0.5, 0.4, 420.0, 0.25,
+                        2.8, 75.0, 24.5, 12000, 1, 0, 0),
+                EnginePoint.now("413999999", 2, 1500.0, 85.0, 0.5, 0.4, 420.0, 0.25,
+                        2.8, 75.0, 24.5, 12000, 1, 0, 0));
+
+        assertEquals(0, service.saveEngineBatch(batch), "主表无一行落库");
+        assertEquals(2.0, counter("smartship_persistence_fallback_total",
+                "type", "engine").count(), "两行必须全部进入兜底");
+        verify(jt, times(2)).update(
+                org.mockito.ArgumentMatchers.argThat(
+                        (String sql) -> sql != null && sql.contains("zncb_failed_writes")),
+                any(Object[].class));
+    }
+
+    @Test
+    @DisplayName("批量路径：逐行补写两次失败的行进三级兜底")
+    void batchRowFallbackAfterRetryExhausted() throws Exception {
+        JdbcTemplate jt = mock(JdbcTemplate.class);
+        javax.sql.DataSource ds = mock(javax.sql.DataSource.class);
+        when(jt.getDataSource()).thenReturn(ds);
+        java.sql.Connection con = mock(java.sql.Connection.class);
+        when(ds.getConnection()).thenReturn(con);
+        java.sql.PreparedStatement ps = mock(java.sql.PreparedStatement.class);
+        when(con.prepareStatement(anyString())).thenReturn(ps);
+        // 整批执行返回 EXECUTE_FAILED → 回滚 → 逐行补写
+        when(ps.executeBatch()).thenReturn(new int[]{java.sql.Statement.EXECUTE_FAILED});
+        // 逐行补写全部抛，兜底插入成功
+        when(jt.update(anyString(), any(Object[].class))).thenAnswer(inv -> {
+            String sql = inv.getArgument(0);
+            if (sql.contains("zncb_failed_writes")) {
+                return 1;
+            }
+            throw new RuntimeException("row down");
+        });
+
+        com.smartship.edge.persist.FileFallbackStore store =
+                mock(com.smartship.edge.persist.FileFallbackStore.class);
+        NmeaDataPersistenceService service =
+                new NmeaDataPersistenceService(jt, properties, null, metrics, store);
+        java.util.List<EnginePoint> batch = java.util.List.of(
+                EnginePoint.now("413999999", 1, 1500.0, 85.0, 0.5, 0.4, 420.0, 0.25,
+                        2.8, 75.0, 24.5, 12000, 1, 0, 0));
+
+        assertEquals(0, service.saveEngineBatch(batch));
+        assertEquals(1.0, counter("smartship_persistence_fallback_total",
+                "type", "engine").count(), "补写耗尽的行必须进兜底");
+    }
 }

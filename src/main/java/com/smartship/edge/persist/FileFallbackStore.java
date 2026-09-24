@@ -28,7 +28,9 @@ import org.springframework.stereotype.Component;
  *   <li>每行一条可回放记录 {@code {stream, mmsi, args:[{t,v}]}}，参数带类型标签，
  *   回放时精确还原 JDBC 参数（含 LocalDateTime）；</li>
  *   <li>追加写带 {@code SYNC}，掉电最多丢最后一行；</li>
- *   <li>磁盘有界：单文件超限即滚动，总量超限删最老文件（调用方对删掉的行计数告警）；</li>
+ *   <li>磁盘有界：单文件超限即滚动，总量超限删最老文件（调用方对删掉的行计数告警）；
+ *   单文件上限按总量派生（总量/4，夹在 64KB~10MB），低配置下总量依然严格有界
+ *   （超限最多一个正在写的 active 文件）；</li>
  *   <li>所有方法 {@code synchronized}：采集线程 spool 与回放线程 drain/rewrite
  *   同一 JVM 内互斥，无需文件锁。</li>
  * </ul>
@@ -49,8 +51,20 @@ public class FileFallbackStore {
     @Autowired
     public FileFallbackStore(EdgeProperties properties) {
         this(Path.of(properties.getCollect().getPersist().getFallbackDir()),
-                DEFAULT_MAX_FILE_BYTES,
-                Math.max(1L, properties.getCollect().getPersist().getFallbackMaxMb()) * 1024L * 1024L);
+                derivedMaxFileBytes(
+                        Math.max(1L, properties.getCollect().getPersist().getFallbackMaxMb())
+                                * 1024L * 1024L),
+                Math.max(1L, properties.getCollect().getPersist().getFallbackMaxMb())
+                        * 1024L * 1024L);
+    }
+
+    /**
+     * 单文件上限派生：总量/4，夹在 64KB~10MB。
+     * <p>固定 10MB 单文件 + 可配小总量（如 1MB）会导致实际用量远超配置；
+     * 派生后超限最多一个 active 文件（active 文件永不参与容量清理）。
+     */
+    static long derivedMaxFileBytes(long maxTotalBytes) {
+        return Math.min(DEFAULT_MAX_FILE_BYTES, Math.max(64L * 1024L, maxTotalBytes / 4));
     }
 
     /** 测试/单测构造：直接指定目录与上限。 */

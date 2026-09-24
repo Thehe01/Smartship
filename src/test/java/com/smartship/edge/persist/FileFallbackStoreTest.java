@@ -69,6 +69,18 @@ class FileFallbackStoreTest {
     }
 
     @Test
+    @DisplayName("单文件上限按总量派生：低配置不撑爆，高配置不频繁滚动")
+    void derivedMaxFileBytesBounds() {
+        assertEquals(256L * 1024L, FileFallbackStore.derivedMaxFileBytes(1024L * 1024L),
+                "1MB 总量 → 256KB 单文件");
+        assertEquals(10L * 1024L * 1024L,
+                FileFallbackStore.derivedMaxFileBytes(100L * 1024L * 1024L),
+                "100MB 总量 → 10MB 封顶");
+        assertEquals(64L * 1024L, FileFallbackStore.derivedMaxFileBytes(4096L),
+                "极小总量 → 64KB 保底");
+    }
+
+    @Test
     @DisplayName("单文件超限滚动，总量超限删最老并返回行数")
     void rotationAndCap() throws Exception {
         // 单文件 1KB 上限：大数据行触发滚动

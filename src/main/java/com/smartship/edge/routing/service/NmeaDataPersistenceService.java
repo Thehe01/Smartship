@@ -359,16 +359,21 @@ public class NmeaDataPersistenceService {
                 log.debug("[Persist-EngineBatch] 整批回滚转逐行补写 ({} 行): {}",
                         args.size(), batchEx.getMessage());
             }
-            int rows = writeEngineRowsFallback(args);
+            int rows = writeEngineRowsFallback(group, args);
             if (rows != args.size()) {
-                log.warn("[Persist-EngineBatch] 分组补写后仍缺 {} 行", args.size() - rows);
+                log.warn("[Persist-EngineBatch] 分组补写后仍缺 {} 行（已转三级兜底）",
+                        args.size() - rows);
             }
             return rows;
         } catch (Exception ex) {
             if (metrics != null) {
                 metrics.recordPersistenceFailure("engine-batch", System.nanoTime() - startNanos);
             }
-            log.warn("[Persist-EngineBatch] 分组写入异常 ({} 行): {}",
+            // 连接都拿不到（DB 整体故障）：整批直接进三级兜底，绝不静默丢失。
+            for (int i = 0; i < args.size(); i++) {
+                writeFallback("engine", group.get(i).mmsi(), args.get(i), ex.getMessage());
+            }
+            log.warn("[Persist-EngineBatch] 分组写入异常，{} 行已转三级兜底: {}",
                     args.size(), ex.getMessage());
             return 0;
         }
@@ -396,22 +401,33 @@ public class NmeaDataPersistenceService {
         }
     }
 
-    private int writeEngineRowsFallback(List<Object[]> args) {
+    /**
+     * 逐行补写：每行最多两次，第二次仍失败则走与单行路径完全相同的三级兜底
+     * （DB 兜底表 → 磁盘 spool → 回放），而不是只记日志。
+     * 调用前整批已显式回滚，无半批残留，因此补写不会产生重复行。
+     */
+    private int writeEngineRowsFallback(List<EnginePoint> group, List<Object[]> args) {
         int rows = 0;
-        for (Object[] arg : args) {
+        for (int i = 0; i < args.size(); i++) {
+            Object[] arg = args.get(i);
+            String mmsi = group.get(i).mmsi();
             boolean ok = false;
+            String lastError = "";
             for (int attempt = 0; attempt < 2 && !ok; attempt++) {
                 try {
                     ok = jdbcTemplate.update(ENGINE_BATCH_SQL, arg) == 1;
                 } catch (Exception retryEx) {
+                    lastError = retryEx.getMessage();
                     if (attempt == 1) {
-                        log.warn("[Persist-EngineBatch] 单行补写两次均失败: {}",
-                                retryEx.getMessage());
+                        log.warn("[Persist-EngineBatch] 单行补写两次均失败，转三级兜底: {}",
+                                lastError);
                     }
                 }
             }
             if (ok) {
                 rows++;
+            } else {
+                writeFallback("engine", mmsi, arg, lastError);
             }
         }
         return rows;

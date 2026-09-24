@@ -45,7 +45,8 @@ smartship:
         enabled: true
         min-write-interval-seconds: 1 # [模块三] CAS 写入节流最小间隔（秒）
         # 本地兜底：主表写入失败先转 zncb_failed_writes；MySQL 整体故障则转磁盘 spool，
-        # 回放器按 replay-interval-ms 周期重放。磁盘有界（fallback-max-mb），超限删最老并计数。
+        # 回放器按 replay-interval-ms 周期重放。磁盘有界（fallback-max-mb，超限删最老并计数；
+        # 单文件上限按总量派生为总量/4，低配置下依然严格有界）。
         fallback-dir: "data/failed-writes"
         fallback-max-mb: 100
         replay-enabled: true
