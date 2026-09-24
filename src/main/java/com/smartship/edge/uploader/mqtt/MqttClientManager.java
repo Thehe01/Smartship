@@ -15,6 +15,10 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
 /**
  * 边端到岸端 MQTT 客户端生命周期管理器
  * <p>
@@ -28,6 +32,17 @@ public class MqttClientManager implements MeterBinder {
     private final EdgeProperties properties;
     private final SmartShipMetrics metrics;
     private MqttClient client;
+
+    /** Application ACK 监听器：岸端 {@code ship/{mmsi}/ack} 到达时触发。 */
+    public interface AckListener {
+        void onAck(String topic, String msgId, String seq);
+    }
+
+    private volatile AckListener ackListener;
+    /** 已登记 ACK 订阅的 MMSI：cleanSession 下每次（重）连都要重新订阅。 */
+    private final Set<String> ackMmsis = ConcurrentHashMap.newKeySet();
+    private static final com.fasterxml.jackson.databind.ObjectMapper ACK_MAPPER =
+            new com.fasterxml.jackson.databind.ObjectMapper();
 
     @Autowired
     public MqttClientManager(EdgeProperties properties, SmartShipMetrics metrics) {
@@ -90,6 +105,8 @@ public class MqttClientManager implements MeterBinder {
                         }
                         log.info("[MQTT] 自动重连成功: uri={}", serverURI);
                     }
+                    // cleanSession 会话不持久：每次连接都要重建 ACK 订阅。
+                    resubscribeAcks();
                 }
 
                 @Override
@@ -102,6 +119,7 @@ public class MqttClientManager implements MeterBinder {
 
                 @Override
                 public void messageArrived(String topic, MqttMessage message) {
+                    dispatchAck(topic, message);
                 }
 
                 @Override
@@ -110,6 +128,7 @@ public class MqttClientManager implements MeterBinder {
             });
 
             client.connect(options);
+            resubscribeAcks();
             if (metrics != null) {
                 metrics.recordMqttConnect(true);
             }
@@ -119,6 +138,65 @@ public class MqttClientManager implements MeterBinder {
                 metrics.recordMqttConnect(false);
             }
             log.warn("[MQTT] 连接 Broker 失败 (弱网离线，稍后将自动重试): {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 注册 Application ACK 监听器（通常指向上传跟踪器）。
+     */
+    public void setAckListener(AckListener ackListener) {
+        this.ackListener = ackListener;
+    }
+
+    /**
+     * 确保订阅该 MMSI 的 Application ACK（{@code ship/{mmsi}/ack}，QoS1）。
+     * 幂等：重复登记只订一次；离线时仅登记，连接恢复后自动补订。
+     */
+    public void ensureAckSubscription(String mmsi) {
+        if (!StringUtils.hasText(mmsi)) {
+            return;
+        }
+        ackMmsis.add(mmsi);
+        MqttClient c = client;
+        if (c != null && c.isConnected()) {
+            try {
+                c.subscribe("ship/" + mmsi + "/ack", properties.getUploader().getMqtt().getQos());
+            } catch (Exception e) {
+                log.warn("[MQTT] ACK 订阅失败 mmsi={}, err={}", mmsi, e.getMessage());
+            }
+        }
+    }
+
+    private void resubscribeAcks() {
+        MqttClient c = client;
+        if (c == null || !c.isConnected() || ackMmsis.isEmpty()) {
+            return;
+        }
+        for (String mmsi : ackMmsis) {
+            try {
+                c.subscribe("ship/" + mmsi + "/ack", properties.getUploader().getMqtt().getQos());
+            } catch (Exception e) {
+                log.warn("[MQTT] ACK 重订阅失败 mmsi={}, err={}", mmsi, e.getMessage());
+            }
+        }
+    }
+
+    /** 解析岸端 Application ACK 并分发；格式不对的直接忽略（不抛、不卡回调线程）。 */
+    private void dispatchAck(String topic, MqttMessage message) {
+        AckListener listener = ackListener;
+        if (listener == null || topic == null || !topic.startsWith("ship/")) {
+            return;
+        }
+        try {
+            Map<?, ?> ack = ACK_MAPPER.readValue(message.getPayload(), Map.class);
+            Object msgId = ack.get("msg_id");
+            if (msgId == null || msgId.toString().isBlank()) {
+                return;
+            }
+            Object seq = ack.get("seq");
+            listener.onAck(topic, msgId.toString(), seq == null ? null : seq.toString());
+        } catch (Exception e) {
+            log.debug("[MQTT] 非 ACK 消息忽略: topic={}", topic);
         }
     }
 

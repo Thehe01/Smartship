@@ -61,6 +61,7 @@ public class DatabaseUploadPoller {
     private final MqttPublisher mqttPublisher;
     private final SmartShipMetrics metrics;
     private final UploadBacklogMetrics backlogMetrics;
+    private final UploadAckTracker ackTracker;
 
     @Autowired
     public DatabaseUploadPoller(EdgeProperties properties,
@@ -68,11 +69,40 @@ public class DatabaseUploadPoller {
                                 MqttPublisher mqttPublisher,
                                 SmartShipMetrics metrics,
                                 UploadBacklogMetrics backlogMetrics) {
+        this(properties, shipDataSourceManager, mqttPublisher, metrics, backlogMetrics,
+                new UploadAckTracker());
+    }
+
+    public DatabaseUploadPoller(EdgeProperties properties,
+                                ShipDataSourceManager shipDataSourceManager,
+                                MqttPublisher mqttPublisher,
+                                SmartShipMetrics metrics,
+                                UploadBacklogMetrics backlogMetrics,
+                                UploadAckTracker ackTracker) {
         this.properties = properties;
         this.shipDataSourceManager = shipDataSourceManager;
         this.mqttPublisher = mqttPublisher;
         this.metrics = metrics;
         this.backlogMetrics = backlogMetrics;
+        this.ackTracker = ackTracker;
+        // 岸端 Application ACK 回来直接进跟踪器（msg_id 全局唯一，无需 topic 定位表）。
+        if (this.mqttPublisher.getClientManager() != null) {
+            this.mqttPublisher.getClientManager().setAckListener((topic, msgId, seq) ->
+                    ackTracker.onAck(extractMmsi(topic), msgId, seq));
+        }
+    }
+
+    /** 测试观察：直接驱动 ACK 流转，无需真实 Broker。 */
+    UploadAckTracker getAckTracker() {
+        return ackTracker;
+    }
+
+    private static String extractMmsi(String topic) {
+        if (topic == null) {
+            return "";
+        }
+        String[] parts = topic.split("/");
+        return parts.length >= 2 ? parts[1] : "";
     }
 
     public DatabaseUploadPoller(EdgeProperties properties,
@@ -127,6 +157,10 @@ public class DatabaseUploadPoller {
         try {
             long lastId = getOrCreateCursorId(jdbcTemplate, stream.tableName());
             int limit = Math.max(1, properties.getUploader().getPoll().getBatchSize());
+            boolean ackMode = properties.getUploader().getAck().isEnabled();
+            if (ackMode && mqttPublisher.getClientManager() != null) {
+                mqttPublisher.getClientManager().ensureAckSubscription(ship.mmsi());
+            }
 
             List<Map<String, Object>> rows = jdbcTemplate.query(
                     "SELECT * FROM " + stream.tableName() + " WHERE id > ? ORDER BY id ASC LIMIT ?",
@@ -135,6 +169,10 @@ public class DatabaseUploadPoller {
             );
 
             if (rows.isEmpty()) {
+                // 本轮无新行：期间到达的 ACK 仍可能推进 watermark。
+                if (ackMode) {
+                    advanceWatermark(jdbcTemplate, ship, stream, lastId);
+                }
                 return;
             }
 
@@ -147,9 +185,27 @@ public class DatabaseUploadPoller {
                 long rowId = (idObj instanceof Number num) ? num.longValue() : Long.parseLong(String.valueOf(idObj));
                 prepareRow(ship, row);
 
+                if (ackMode && ackTracker.inFlightCount(ship.mmsi(), stream.tableName())
+                        >= Math.max(1, properties.getUploader().getAck().getMaxInFlight())) {
+                    // 有限滑动窗口：等 ACK 回来再发新消息，禁止无界在途。
+                    log.info("[Uploader] 在途窗口已满，等 ACK 后再发: table={}, mmsi={}",
+                            stream.tableName(), ship.mmsi());
+                    break;
+                }
+                if (ackMode && ackTracker.isTracked(ship.mmsi(), stream.tableName(), rowId)) {
+                    // 已在途（或已 ACK 待 watermark）：主循环只发新行，超时未达由补发专路处理。
+                    continue;
+                }
+
                 boolean ok = mqttPublisher.publish(ship.mmsi(), stream.type(), stream.topicSuffix(), row);
                 if (ok) {
-                    maxSuccessId = Math.max(maxSuccessId, rowId);
+                    if (ackMode) {
+                        // PUBACK 只记 IN_FLIGHT，游标不动，等 Application ACK。
+                        ackTracker.track(ship.mmsi(), stream.tableName(), rowId,
+                                MqttPublisher.stableMessageId(ship.mmsi(), stream.type(), row));
+                    } else {
+                        maxSuccessId = Math.max(maxSuccessId, rowId);
+                    }
                     successCount++;
                     if (metrics != null) {
                         metrics.recordUploadRows(stream.streamKey(), true, 1);
@@ -166,8 +222,11 @@ public class DatabaseUploadPoller {
                 }
             }
 
-            // 仅在成功时推进游标
-            if (maxSuccessId > lastId) {
+            if (ackMode) {
+                resendTimedOut(jdbcTemplate, ship, stream, limit);
+                advanceWatermark(jdbcTemplate, ship, stream, lastId);
+            } else if (maxSuccessId > lastId) {
+                // 旧语义（ACK 关闭）：PUBACK 即推进游标。
                 updateCursorId(jdbcTemplate, stream.tableName(), maxSuccessId);
                 log.info("[Uploader] 上传成功: shipId={}, table={}, count={}, 游标推进: {} -> {}",
                         ship.shipId(), stream.tableName(), successCount, lastId, maxSuccessId);
@@ -183,6 +242,62 @@ public class DatabaseUploadPoller {
             }
             log.warn("[Uploader] 增量表查询/上报异常: table={}, err={}", stream.tableName(), e.getMessage());
         }
+    }
+
+    /** 连续 ACK watermark 能推进才写游标；乱序缺口前停住等补发。 */
+    private void advanceWatermark(JdbcTemplate jdbcTemplate, ShipDataSourceManager.ShipDatabase ship,
+                                 IncrementalStream stream, long lastId) {
+        long watermark = ackTracker.watermark(ship.mmsi(), stream.tableName(), lastId);
+        if (watermark > lastId) {
+            updateCursorId(jdbcTemplate, stream.tableName(), watermark);
+            log.info("[Uploader] ACK watermark 推进: shipId={}, table={}, 游标: {} -> {}",
+                    ship.shipId(), stream.tableName(), lastId, watermark);
+        }
+    }
+
+    /**
+     * 超时未 ACK 的补发（限本轮 batchSize 条）：按 id 回查原行重发，msg_id 由业务键
+     * 确定故与之前完全相同，岸端去重吸收。行已不在（被清理）则放弃跟踪。
+     */
+    private void resendTimedOut(JdbcTemplate jdbcTemplate, ShipDataSourceManager.ShipDatabase ship,
+                                IncrementalStream stream, int limit) {
+        List<UploadAckTracker.Tracked> due = ackTracker.resendDue(
+                ship.mmsi(), stream.tableName(),
+                properties.getUploader().getAck().getAckTimeoutMs());
+        int n = Math.min(due.size(), Math.max(1, limit));
+        for (int i = 0; i < n; i++) {
+            UploadAckTracker.Tracked t = due.get(i);
+            Map<String, Object> row = queryRowById(jdbcTemplate, stream.tableName(), t.rowId());
+            if (row == null) {
+                log.warn("[Uploader] 补发行已不在，放弃跟踪: table={}, id={}",
+                        stream.tableName(), t.rowId());
+                ackTracker.forget(ship.mmsi(), stream.tableName(), t.rowId());
+                continue;
+            }
+            prepareRow(ship, row);
+            boolean ok = mqttPublisher.publish(ship.mmsi(), stream.type(), stream.topicSuffix(), row);
+            if (ok) {
+                ackTracker.track(ship.mmsi(), stream.tableName(), t.rowId(), t.msgId());
+                if (metrics != null) {
+                    metrics.recordUploadRows(stream.streamKey(), true, 1);
+                }
+            } else {
+                if (metrics != null) {
+                    metrics.recordUploadRows(stream.streamKey(), false, 1);
+                }
+                log.warn("[Uploader] 补发失败，短路等待下轮: table={}, failId={}",
+                        stream.tableName(), t.rowId());
+                break;
+            }
+        }
+    }
+
+    private Map<String, Object> queryRowById(JdbcTemplate jdbcTemplate, String table, long rowId) {
+        List<Map<String, Object>> rows = jdbcTemplate.query(
+                "SELECT * FROM " + table + " WHERE id = ?",
+                (rs, rowNum) -> toMap(rs),
+                rowId);
+        return rows.isEmpty() ? null : rows.get(0);
     }
 
     private void prepareRow(ShipDataSourceManager.ShipDatabase ship, Map<String, Object> row) {

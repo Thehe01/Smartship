@@ -293,19 +293,20 @@ public class ObservabilityMetricsTest {
         );
 
         DatabaseUploadPoller poller = new DatabaseUploadPoller(
-                properties, shipDataSourceManager, mqttPublisher, smartShipMetrics, null
+                properties, shipDataSourceManager, mqttPublisher, smartShipMetrics, null,
+                new com.smartship.edge.uploader.UploadAckTracker()
         );
 
         DatabaseUploadPoller.IncrementalStream gpsStream = new DatabaseUploadPoller.IncrementalStream(
                 "gps", "zncb_gps_data", "nmea_gps", "nmea_gps"
         );
 
-        // 第一批上传全部成功
+        // 第一批上传 PUBACK 全部成功：只记在途，游标不动（等 Application ACK）。
         poller.uploadIncrementalStream(jt, ship, gpsStream);
 
         Long cursorAfterFirst = jt.queryForObject(
                 "SELECT last_uploaded_id FROM zncb_upload_cursor WHERE stream_name = 'zncb_gps_data'", Long.class);
-        assertEquals(3L, cursorAfterFirst, "游标应推进到 3");
+        assertEquals(0L, cursorAfterFirst, "PUBACK 不推进游标，等 Application ACK");
 
         Counter rowsSuccess = registry.find("smartship_uploader_rows_total")
                 .tag("stream", "gps")
@@ -334,7 +335,7 @@ public class ObservabilityMetricsTest {
 
         Long cursorAfterSecond = jt.queryForObject(
                 "SELECT last_uploaded_id FROM zncb_upload_cursor WHERE stream_name = 'zncb_gps_data'", Long.class);
-        assertEquals(4L, cursorAfterSecond, "游标应精确冻结在成功断点 4，绝不推进到 5");
+        assertEquals(0L, cursorAfterSecond, "无 ACK 且有发送失败：游标冻结，绝不推进");
 
         assertEquals(4.0, rowsSuccess.count());
 

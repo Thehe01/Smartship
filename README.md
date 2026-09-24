@@ -72,6 +72,7 @@ flowchart TD
 - **游标驱动轻量断点续传**：基于本地 `zncb_upload_cursor` 记录每条数据流的 `last_uploaded_id` 与 `last_uploaded_time`，支持离线堆积与断网恢复后的无缝续查。
 - **断网短路保护（Break-on-Failure）**：网络异常时坚决 `break` 终止批次，冻结游标在最后一个成功断点处，杜绝航迹空洞与数据丢失。
 - **确定性稳定 Message ID（SHA-256）**：提取记录的自然主键与时间戳计算 SHA-256 散列，生成恒定的 64 位指纹，为岸端通过 Redis 或时序库唯一键实现业务级幂等去重提供基础。
+- **Application ACK（Kafka durable 确认）**：PUBACK 只记在途不推游标；岸端 Kafka `acks=all` 落定后回 `ship/{mmsi}/ack`（`{msg_id, seq, KAFKA_COMMITTED}`），游标按连续 ACK watermark 推进；乱序只记账、超时按 id 回查补发、窗口满停发等 ACK；`ack.enabled=false` 可退回 PUBACK 旧语义。详见岸端 `docs/APPLICATION_ACK.md`。
 
 ---
 

@@ -27,6 +27,10 @@ public class EdgeProperties {
     public static class Persist {
         private boolean enabled = true;
         private int minWriteIntervalSeconds = 1;
+        /** 主机工况批量写入开关：开启后 Modbus 采集线程按船攒批，满批后一次 batchUpdate 落库。默认关闭，行为与单行 saveEngine 完全一致。 */
+        private boolean engineBatchEnabled = false;
+        /** 满批行数（按船分组计数），默认 500。 */
+        private int engineBatchSize = 500;
         private PoolConfig pool = new PoolConfig();
     }
 
@@ -91,6 +95,25 @@ public class EdgeProperties {
         private boolean enabled = true;
         private PollConfig poll = new PollConfig();
         private MqttConfig mqtt = new MqttConfig();
+        private AckConfig ack = new AckConfig();
+    }
+
+    /**
+     * Application ACK 交易配置（对应岸端 {@code ship/{mmsi}/ack} 的
+     * {@code KAFKA_COMMITTED} 确认）。
+     *
+     * <p>PUBACK 只表示 Broker 已接收，不推进最终游标；只有收到匹配
+     * {@code msg_id}（及 {@code seq}，如有）的 Application ACK 后，才推进连续
+     * ACK watermark。ACK 可能丢失或重复（QoS1），绝不凭空产生。
+     */
+    @Data
+    public static class AckConfig {
+        /** 总开关；关闭时退回 PUBACK 即推进游标的旧语义（兼容未升级岸端）。 */
+        private boolean enabled = true;
+        /** 发送后多久没收到 ACK 算超时，进入补发集合。 */
+        private long ackTimeoutMs = 30000L;
+        /** 每个（船舶，表）最多允许的未确认在途数：满了就停发新消息等 ACK。 */
+        private int maxInFlight = 200;
     }
 
     @Data

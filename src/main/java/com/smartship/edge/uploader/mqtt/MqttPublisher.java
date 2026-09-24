@@ -40,6 +40,11 @@ public class MqttPublisher {
 
     private final MqttClientManager mqttClientManager;
 
+    /** 供上传引擎复用同一连接订阅 Application ACK。 */
+    public MqttClientManager getClientManager() {
+        return mqttClientManager;
+    }
+
     public boolean publish(String mmsi, String type, String topicSuffix, Map<String, Object> row) {
         Map<String, Object> payload = new LinkedHashMap<>(row);
         payload.put("mmsi", mmsi);
