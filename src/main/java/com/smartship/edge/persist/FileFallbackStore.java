@@ -78,6 +78,14 @@ public class FileFallbackStore {
     public synchronized long spool(String stream, String mmsi, Object[] args) throws IOException {
         Files.createDirectories(dir);
         rotateIfNeeded();
+        byte[] line = (argsToJson(stream, mmsi, args) + "\n").getBytes(StandardCharsets.UTF_8);
+        Files.write(activeFile(), line,
+                StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.SYNC);
+        return enforceTotalCap();
+    }
+
+    /** 单行记录编码（文件 spool 与 DB 兜底表共用同一格式，保证两处都可回放）。 */
+    public static String argsToJson(String stream, String mmsi, Object[] args) {
         ObjectNode root = MAPPER.createObjectNode();
         root.put("v", 1);
         root.put("ts", LocalDateTime.now().toString());
@@ -89,10 +97,32 @@ public class FileFallbackStore {
                 arr.add(MAPPER.valueToTree(encode(a)));
             }
         }
-        byte[] line = (MAPPER.writeValueAsString(root) + "\n").getBytes(StandardCharsets.UTF_8);
-        Files.write(activeFile(), line,
-                StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.SYNC);
-        return enforceTotalCap();
+        return root.toString();
+    }
+
+    /** 解析单行记录；格式不对抛 IllegalArgumentException（调用方跳过保留现场）。 */
+    public static ParsedLine parseLine(String line) {
+        final JsonNode root;
+        try {
+            root = MAPPER.readTree(line);
+        } catch (Exception e) {
+            throw new IllegalArgumentException("not JSON: " + e.getMessage(), e);
+        }
+        JsonNode arr = root.path("args");
+        if (!root.isObject() || !arr.isArray()) {
+            throw new IllegalArgumentException("missing args[]");
+        }
+        List<TypedArg> args = new ArrayList<>();
+        for (JsonNode n : arr) {
+            args.add(new TypedArg(n.path("t").asText("s"), n.path("v").asText(null)));
+        }
+        return new ParsedLine(
+                root.path("stream").asText(""),
+                root.path("mmsi").asText(""),
+                List.copyOf(args));
+    }
+
+    public record ParsedLine(String stream, String mmsi, List<TypedArg> args) {
     }
 
     /** 最老优先列出待回放文件（含当前 active 文件）。 */
@@ -122,18 +152,9 @@ public class FileFallbackStore {
                 continue;
             }
             try {
-                JsonNode root = MAPPER.readTree(line);
-                List<TypedArg> args = new ArrayList<>();
-                JsonNode arr = root.path("args");
-                if (arr.isArray()) {
-                    for (JsonNode n : arr) {
-                        args.add(new TypedArg(n.path("t").asText("s"), n.path("v").asText(null)));
-                    }
-                }
+                ParsedLine parsed = parseLine(line);
                 records.add(new ReplayRecord(
-                        root.path("stream").asText(""),
-                        root.path("mmsi").asText(""),
-                        List.copyOf(args), line));
+                        parsed.stream(), parsed.mmsi(), parsed.args(), line));
             } catch (Exception e) {
                 badLines++;
                 log.warn("[Fallback] spool 坏行跳过: {}", e.getMessage());
@@ -257,9 +278,11 @@ public class FileFallbackStore {
             if (f.path().getFileName().toString().equals(ACTIVE_FILE)) {
                 continue;
             }
+            // 先取值再删：delete 后再 Files.size 会抛 NoSuchFileException。
+            long size = Files.size(f.path());
             long lines = countLines(f.path());
             Files.deleteIfExists(f.path());
-            total -= Files.size(f.path());
+            total -= size;
             dropped += lines;
             log.warn("[Fallback] 磁盘超限删除最老 spool 文件: {} (约 {} 行)",
                     f.path().getFileName(), lines);

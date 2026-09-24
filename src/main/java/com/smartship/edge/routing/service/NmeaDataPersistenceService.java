@@ -128,9 +128,9 @@ public class NmeaDataPersistenceService {
     }
 
     private void writeFallback(String stream, String mmsi, Object[] args, String error) {
-        // tier 1：同库兜底表（可查询、可审计）
+        // tier 1：同库兜底表（可查询、可审计；payload 存可回放 JSON，回放器会重写入主表）
         try {
-            String payload = truncate(java.util.Arrays.deepToString(args), 2000);
+            String payload = truncate(FileFallbackStore.argsToJson(stream, mmsi, args), 65535);
             String err = truncate(error, 500);
             jdbcTemplate.update(FALLBACK_SQL, stream, mmsi, payload, err);
             if (metrics != null) {

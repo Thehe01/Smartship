@@ -79,14 +79,17 @@ class FileFallbackStoreTest {
         store.spool("gps", "m", new Object[]{big});
         assertEquals(2, store.pendingFiles().size(), "超限必须滚动出第二文件");
 
-        // 总量 4KB 上限：继续写触发删最老
+        // 总量 4KB 上限：继续写触发删最老（回归：删后取值曾抛 NoSuchFileException）
         FileFallbackStore capped = new FileFallbackStore(tempDir, 1024L, 4096L);
-        long dropped = capped.spool("gps", "m", new Object[]{big});
-        assertTrue(dropped >= 0);
+        long droppedTotal = 0;
+        for (int i = 0; i < 8; i++) {
+            droppedTotal += capped.spool("gps", "m", new Object[]{big});
+        }
         long total = 0;
         for (FileFallbackStore.PendingFile f : capped.pendingFiles()) {
             total += Files.size(f.path());
         }
         assertTrue(total <= 4096L + 2048L, "总量必须有界，实际=" + total);
+        assertTrue(droppedTotal > 0, "超限必须删最老文件并返回行数，实际=" + droppedTotal);
     }
 }

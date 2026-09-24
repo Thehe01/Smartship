@@ -83,6 +83,20 @@ class PersistenceFallbackTest {
                 "type", "wind", "result", "failure").count());
         assertEquals(1.0, counter("smartship_persistence_fallback_total",
                 "type", "wind").count());
+
+        // 第三次调用是兜底表插入：payload 必须是可回放 JSON（与回放器同一编解码）。
+        org.mockito.ArgumentCaptor<String> sqlCaptor =
+                org.mockito.ArgumentCaptor.forClass(String.class);
+        org.mockito.ArgumentCaptor<Object[]> argsCaptor =
+                org.mockito.ArgumentCaptor.forClass(Object[].class);
+        verify(jt, times(3)).update(sqlCaptor.capture(), argsCaptor.capture());
+        Object[] fallbackArgs = argsCaptor.getAllValues().get(2);
+        assertEquals("wind", fallbackArgs[0]);
+        com.smartship.edge.persist.FileFallbackStore.ParsedLine parsed =
+                com.smartship.edge.persist.FileFallbackStore.parseLine((String) fallbackArgs[2]);
+        assertEquals("wind", parsed.stream());
+        assertEquals("413999999", parsed.mmsi());
+        assertEquals(10, parsed.args().size(), "wind 行 10 个参数必须完整可回放");
     }
 
     @Test

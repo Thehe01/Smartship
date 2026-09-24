@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS zncb_failed_writes (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     stream VARCHAR(32) NOT NULL COMMENT '遥测流 gps/wind/depth/rudder/engine',
     mmsi VARCHAR(32) NOT NULL COMMENT '本船 MMSI',
-    payload TEXT COMMENT '截断后的行参数',
+    payload TEXT COMMENT '可回放 JSON {stream,mmsi,args:[{t,v}]}（回放器重写入主表后删除该行）',
     error VARCHAR(500) COMMENT '最终失败原因',
     create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_stream_ts (stream, create_time)

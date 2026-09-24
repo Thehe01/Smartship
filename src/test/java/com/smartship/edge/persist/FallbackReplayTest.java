@@ -113,4 +113,64 @@ class FallbackReplayTest {
         assertEquals(1.0, registry.find("smartship_persistence_replay_total")
                 .tags("result", "failure").counter().count());
     }
+
+    private static final String FAILED_WRITES_DDL = """
+            CREATE TABLE zncb_failed_writes (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                stream VARCHAR(32), mmsi VARCHAR(32),
+                payload TEXT, error VARCHAR(500),
+                create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""";
+
+    private JdbcTemplate dbWithFallbackTable() {
+        DriverManagerDataSource ds = new DriverManagerDataSource(
+                "jdbc:h2:mem:dbreplay_test_" + System.nanoTime() + ";DB_CLOSE_DELAY=-1;MODE=MySQL",
+                "sa", "");
+        JdbcTemplate jt = new JdbcTemplate(ds);
+        jt.execute(GPS_DDL);
+        jt.execute(FAILED_WRITES_DDL);
+        return jt;
+    }
+
+    @Test
+    @DisplayName("DB兜底行回放进主表并删行")
+    void dbFallbackRowsReplayIntoMainTable() {
+        JdbcTemplate jt = dbWithFallbackTable();
+        Object[] args = {"S001", "413999999", "RMC", "SERIAL",
+                java.time.LocalDateTime.of(2026, 9, 19, 10, 0, 0),
+                31.2, 121.5, 12.0, 180.0, 180.0, 180.0, 0.0, 10.0, 8, 1.0, 1, "A"};
+        jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, payload, error) VALUES (?,?,?,?)",
+                "gps", "413999999",
+                com.smartship.edge.persist.FileFallbackStore.argsToJson("gps", "413999999", args),
+                "boom");
+
+        EdgeProperties properties = new EdgeProperties();
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        FallbackReplayer replayer = new FallbackReplayer(jt, properties, new FileFallbackStore(tempDir, 1024L, 4096L), new SmartShipMetrics(registry));
+        replayer.replay();
+
+        assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class),
+                "DB兜底行必须重写入主表");
+        assertEquals(0L, jt.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class),
+                "回放成功必须删行");
+        assertEquals(1.0, registry.find("smartship_persistence_replay_total")
+                .tags("result", "success").counter().count());
+    }
+
+    @Test
+    @DisplayName("旧版诊断文本行解析失败留原地，不阻塞、不崩溃")
+    void legacyNonJsonRowLeftInPlace() {
+        JdbcTemplate jt = dbWithFallbackTable();
+        jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, payload, error) VALUES (?,?,?,?)",
+                "gps", "413999999", "{ship_id=S001, mmsi=413999999}", "legacy");
+
+        EdgeProperties properties = new EdgeProperties();
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        FallbackReplayer replayer = new FallbackReplayer(jt, properties, new FileFallbackStore(tempDir, 1024L, 4096L), new SmartShipMetrics(registry));
+        replayer.replay();
+
+        assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class),
+                "毒行保留供人工审计");
+        assertEquals(0L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class));
+    }
 }
