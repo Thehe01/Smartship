@@ -24,9 +24,9 @@ import java.util.function.Supplier;
  *   照常查出重发，msg_id 由业务键确定故与之前完全相同。</li>
  * </ul>
  *
- * <p>键空间为（mmsi，表名），与游标表粒度一致；另有 msg_id 全局二级索引供 ACK
- * 分发（msg_id 全局唯一，含 mmsi 指纹）。非线程安全——调用方（poller 定时线程
- * + MQTT 回调线程）需外部同步；本类只保证单线程下的确定性。
+ * <p>线程安全：MQTT 回调线程与 poller 定时线程并发访问本类；所有方法用统一
+ * 内置锁串行化（简单明确）。注意锁只保护内存状态，绝不跨网络 I/O 持有——
+ * 跨调用的组合序列（如先查后登记）靠幂等 upsert + 失败清理保证正确，不靠锁。
  */
 @Slf4j
 public class UploadAckTracker {
@@ -77,9 +77,27 @@ public class UploadAckTracker {
     /**
      * PUBACK 成功后登记在途。若同一行已在途（重发），刷新发送时间戳；
      * 若已 ACK（ACK 先到、PUBACK 循环迟到之类乱序），保持 ACKED 不动。
+     *
+     * <p>调用方在 publish <b>之前</b>先登记（预注册），ACK 即使在 PUBACK 返回前
+     * 到达也能命中；publish 失败时按“是否新建”决定是否清理（见 poller）。
      */
-    public void track(String mmsi, String tableName, long rowId, String msgId) {
+    public synchronized void track(String mmsi, String tableName, long rowId, String msgId) {
         trackAt(mmsi, tableName, rowId, msgId, clock.get());
+    }
+
+    /**
+     * 实际发出后的时间戳重锚定：只刷新已存在且在途的登记；已裁剪（不存在）或
+     * 已 ACK 的保持不动——绝不复活已确认行，避免游标/窗口记账膨胀。
+     */
+    public synchronized void confirmSent(String mmsi, String tableName, long rowId) {
+        TreeMap<Long, Tracked> rows = tables.get(key(mmsi, tableName));
+        if (rows == null) {
+            return;
+        }
+        Tracked existing = rows.get(rowId);
+        if (existing != null && existing.state() == State.IN_FLIGHT) {
+            rows.put(rowId, existing.resent(clock.get()));
+        }
     }
 
     void trackAt(String mmsi, String tableName, long rowId, String msgId, long nowMs) {
@@ -100,7 +118,7 @@ public class UploadAckTracker {
      *
      * @return true 表示命中了一条在途记录并标记 ACKED
      */
-    public boolean onAck(String mmsi, String msgId, String seq) {
+    public synchronized boolean onAck(String mmsi, String msgId, String seq) {
         EntryRef ref = byMsgId.get(msgId);
         if (ref == null) {
             log.debug("[Uploader-ACK] 未知 ACK 忽略: mmsi={}, msg_id={}", mmsi, msgId);
@@ -131,7 +149,7 @@ public class UploadAckTracker {
      * 不大于见过最大值的行号视为空洞（若存在早被查出登记）直接跳过；超出见过
      * 范围或遇到未 ACK 即停。推进后裁剪已确认前缀（两份索引同步清理）。
      */
-    public long watermark(String mmsi, String tableName, long cursorBase) {
+    public synchronized long watermark(String mmsi, String tableName, long cursorBase) {
         String k = key(mmsi, tableName);
         TreeMap<Long, Tracked> rows = tables.get(k);
         if (rows == null || rows.isEmpty()) {
@@ -174,13 +192,13 @@ public class UploadAckTracker {
 
     /**
      * 超时未 ACK 的在途集合（升序），供 poller 补发，调用方自行限量。
-     * 补发后必须调 {@link #track} 刷新时间戳，否则下次还会被捞出。
+     * 补发成功后调 {@link #confirmSent} 重锚时间戳，否则下次还会被捞出。
      */
-    public List<Tracked> resendDue(String mmsi, String tableName, long ackTimeoutMs) {
+    public synchronized List<Tracked> resendDue(String mmsi, String tableName, long ackTimeoutMs) {
         return resendDueAt(mmsi, tableName, ackTimeoutMs, clock.get());
     }
 
-    List<Tracked> resendDueAt(String mmsi, String tableName, long ackTimeoutMs, long nowMs) {
+    synchronized List<Tracked> resendDueAt(String mmsi, String tableName, long ackTimeoutMs, long nowMs) {
         List<Tracked> due = new ArrayList<>();
         for (Tracked t : table(mmsi, tableName).values()) {
             if (t.state() == State.IN_FLIGHT && nowMs - t.sentAtMs() >= ackTimeoutMs) {
@@ -191,13 +209,13 @@ public class UploadAckTracker {
     }
 
     /** 是否已登记（任何状态）：主循环只发新行，已在途的等 ACK 或超时补发。 */
-    public boolean isTracked(String mmsi, String tableName, long rowId) {
+    public synchronized boolean isTracked(String mmsi, String tableName, long rowId) {
         TreeMap<Long, Tracked> rows = tables.get(key(mmsi, tableName));
         return rows != null && rows.containsKey(rowId);
     }
 
     /** 放弃跟踪一行（源行已被清理，补发无意义）。 */
-    public void forget(String mmsi, String tableName, long rowId) {
+    public synchronized void forget(String mmsi, String tableName, long rowId) {
         TreeMap<Long, Tracked> rows = tables.get(key(mmsi, tableName));
         if (rows == null) {
             return;
@@ -209,7 +227,8 @@ public class UploadAckTracker {
     }
 
     /** 在途计数：滑动窗口满则停发新消息等 ACK。 */
-    public int inFlightCount(String mmsi, String tableName) {        int n = 0;
+    public synchronized int inFlightCount(String mmsi, String tableName) {
+        int n = 0;
         for (Tracked t : table(mmsi, tableName).values()) {
             if (t.state() == State.IN_FLIGHT) {
                 n++;
@@ -219,7 +238,7 @@ public class UploadAckTracker {
     }
 
     /** 测试观察：当前登记总数。 */
-    int trackedCount(String mmsi, String tableName) {
+    synchronized int trackedCount(String mmsi, String tableName) {
         return table(mmsi, tableName).size();
     }
 }

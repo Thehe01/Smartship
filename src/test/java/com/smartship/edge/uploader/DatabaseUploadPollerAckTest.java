@@ -200,4 +200,52 @@ class DatabaseUploadPollerAckTest {
         assertTrue(publishedRows().size() >= 2, "补发路径被执行");
         assertEquals(0L, cursor(), "补发未 ACK 前游标不动");
     }
+
+    @Test
+    @DisplayName("ACK 在 publish 返回前到达：预注册命中，watermark 照常推进")
+    void ackArrivingMidPublishStillMatches() {
+        insertRows(1001, 1002);
+        // 模拟岸端极快：PUBACK 还没返回，Application ACK 已经到了。
+        // 旧流程（先发布后登记）会把这条 ACK 当未知丢弃；预注册必须命中。
+        when(publisher.publish(anyString(), anyString(), anyString(), anyMap()))
+                .thenAnswer((org.mockito.stubbing.Answer<Boolean>) inv -> {
+                    Map<String, Object> row = inv.getArgument(3);
+                    Object idObj = row.get("id");
+                    long rowId = (idObj instanceof Number num) ? num.longValue()
+                            : Long.parseLong(String.valueOf(idObj));
+                    tracker.onAck(MMSI, MqttPublisher.stableMessageId(MMSI, "nmea_gps", row),
+                            String.valueOf(rowId));
+                    return true;
+                });
+
+        poller.uploadIncrementalStream(jdbc, ship, stream());
+
+        assertEquals(1002L, cursor(), "PUBACK 返回前的 ACK 必须 counted，游标一次推进");
+    }
+
+    @Test
+    @DisplayName("publish 失败：预注册被清理，可正常重试，不推游标不造假 ACK")
+    void failedPublishCleansPreRegistration() {
+        insertRows(1001);
+        when(publisher.publish(anyString(), anyString(), anyString(), anyMap()))
+                .thenReturn(false);
+
+        poller.uploadIncrementalStream(jdbc, ship, stream());
+
+        assertFalse(tracker.isTracked(MMSI, TABLE, 1001L), "预注册必须回滚");
+        assertEquals(0, tracker.inFlightCount(MMSI, TABLE));
+        assertEquals(0L, cursor(), "失败不推游标");
+
+        // 恢复后重试：登记-确认-推进全链路正常。
+        when(publisher.publish(anyString(), anyString(), anyString(), anyMap()))
+                .thenReturn(true);
+        poller.uploadIncrementalStream(jdbc, ship, stream());
+        assertTrue(tracker.isTracked(MMSI, TABLE, 1001L));
+        assertEquals(0L, cursor(), "ACK 到达前游标仍不动");
+
+        Map<String, Object> row = publishedRows().get(publishedRows().size() - 1);
+        tracker.onAck(MMSI, MqttPublisher.stableMessageId(MMSI, "nmea_gps", row), "1001");
+        poller.uploadIncrementalStream(jdbc, ship, stream());
+        assertEquals(1001L, cursor(), "重试成功 + ACK 后游标推进");
+    }
 }

@@ -39,6 +39,8 @@ public class MqttClientManager implements MeterBinder {
     }
 
     private volatile AckListener ackListener;
+    /** 岸端 Application ACK 的唯一合法状态：Kafka durable 落定。 */
+    static final String STATUS_KAFKA_COMMITTED = "KAFKA_COMMITTED";
     /** 已登记 ACK 订阅的 MMSI：cleanSession 下每次（重）连都要重新订阅。 */
     private final Set<String> ackMmsis = ConcurrentHashMap.newKeySet();
     private static final com.fasterxml.jackson.databind.ObjectMapper ACK_MAPPER =
@@ -182,7 +184,7 @@ public class MqttClientManager implements MeterBinder {
     }
 
     /** 解析岸端 Application ACK 并分发；格式不对的直接忽略（不抛、不卡回调线程）。 */
-    private void dispatchAck(String topic, MqttMessage message) {
+    void dispatchAck(String topic, MqttMessage message) {
         AckListener listener = ackListener;
         if (listener == null || topic == null || !topic.startsWith("ship/")) {
             return;
@@ -191,6 +193,13 @@ public class MqttClientManager implements MeterBinder {
             Map<?, ?> ack = ACK_MAPPER.readValue(message.getPayload(), Map.class);
             Object msgId = ack.get("msg_id");
             if (msgId == null || msgId.toString().isBlank()) {
+                return;
+            }
+            // 只认 Kafka 落定确认：缺失、为空、非 KAFKA_COMMITTED 一律忽略。
+            // 未来若有新 status（如消费落定），必须显式加白，不能默认放行。
+            Object status = ack.get("status");
+            if (!STATUS_KAFKA_COMMITTED.equals(status == null ? null : status.toString())) {
+                log.debug("[MQTT] 非 KAFKA_COMMITTED ACK 忽略: topic={}", topic);
                 return;
             }
             Object seq = ack.get("seq");

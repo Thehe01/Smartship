@@ -197,13 +197,15 @@ public class DatabaseUploadPoller {
                     continue;
                 }
 
-                boolean ok = mqttPublisher.publish(ship.mmsi(), stream.type(), stream.topicSuffix(), row);
+                boolean ok;
+                if (ackMode) {
+                    ok = publishTracked(ship, stream, row, rowId,
+                            MqttPublisher.stableMessageId(ship.mmsi(), stream.type(), row));
+                } else {
+                    ok = mqttPublisher.publish(ship.mmsi(), stream.type(), stream.topicSuffix(), row);
+                }
                 if (ok) {
-                    if (ackMode) {
-                        // PUBACK 只记 IN_FLIGHT，游标不动，等 Application ACK。
-                        ackTracker.track(ship.mmsi(), stream.tableName(), rowId,
-                                MqttPublisher.stableMessageId(ship.mmsi(), stream.type(), row));
-                    } else {
+                    if (!ackMode) {
                         maxSuccessId = Math.max(maxSuccessId, rowId);
                     }
                     successCount++;
@@ -244,6 +246,33 @@ public class DatabaseUploadPoller {
         }
     }
 
+    /**
+     * 带预注册的发送：先登记后发布，关闭“ACK 先于 track 到达即丢”的窗口。
+     *
+     * <ul>
+     *   <li>登记在 publish 之前：Application ACK 即使在 PUBACK 返回前到达也能命中，
+     *   不会被当成未知 ACK 丢弃；</li>
+     *   <li>成功后重锚时间戳（仅刷新在途登记，已裁剪/已 ACK 的不动，绝不复活）；</li>
+     *   <li>失败时仅当本轮新建才清理（回滚预注册）：补发路径的旧在途状态保留，
+     *   下轮继续等 ACK 或超时补发；游标两种情况都不动，更不产生假 ACK。</li>
+     * </ul>
+     */
+    private boolean publishTracked(ShipDataSourceManager.ShipDatabase ship,
+                                   IncrementalStream stream, Map<String, Object> row,
+                                   long rowId, String msgId) {
+        String mmsi = ship.mmsi();
+        String table = stream.tableName();
+        boolean fresh = !ackTracker.isTracked(mmsi, table, rowId);
+        ackTracker.track(mmsi, table, rowId, msgId);
+        boolean ok = mqttPublisher.publish(mmsi, stream.type(), stream.topicSuffix(), row);
+        if (ok) {
+            ackTracker.confirmSent(mmsi, table, rowId);
+        } else if (fresh) {
+            ackTracker.forget(mmsi, table, rowId);
+        }
+        return ok;
+    }
+
     /** 连续 ACK watermark 能推进才写游标；乱序缺口前停住等补发。 */
     private void advanceWatermark(JdbcTemplate jdbcTemplate, ShipDataSourceManager.ShipDatabase ship,
                                  IncrementalStream stream, long lastId) {
@@ -275,14 +304,13 @@ public class DatabaseUploadPoller {
                 continue;
             }
             prepareRow(ship, row);
-            boolean ok = mqttPublisher.publish(ship.mmsi(), stream.type(), stream.topicSuffix(), row);
+            // 补发同样先登记后发布（条目已在途，失败时保留旧状态等下轮）。
+            boolean ok = publishTracked(ship, stream, row, t.rowId(), t.msgId());
             if (ok) {
-                ackTracker.track(ship.mmsi(), stream.tableName(), t.rowId(), t.msgId());
                 if (metrics != null) {
                     metrics.recordUploadRows(stream.streamKey(), true, 1);
                 }
-            } else {
-                if (metrics != null) {
+            } else {                if (metrics != null) {
                     metrics.recordUploadRows(stream.streamKey(), false, 1);
                 }
                 log.warn("[Uploader] 补发失败，短路等待下轮: table={}, failId={}",

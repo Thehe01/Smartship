@@ -85,4 +85,58 @@ class UploadAckTrackerTest {
         assertFalse(tracker.onAck(MMSI, "msg-1001", "1001"),
                 "裁剪后的迟到重复 ACK 直接忽略");
     }
+
+    @Test
+    @DisplayName("并发：poller 与 MQTT 回调同时读写，终态与单线程一致")
+    void concurrentAccessConverges() throws Exception {
+        UploadAckTracker tracker = new UploadAckTracker();
+        int threads = 8;
+        int perThread = 200;
+        // 线程 t 独占行号段 [t*10000+1, t*10000+perThread]：段间空洞天然存在，
+        // 顺带并发覆盖空洞跳过逻辑。
+        java.util.concurrent.ExecutorService pool =
+                java.util.concurrent.Executors.newFixedThreadPool(threads * 2);
+        try {
+            java.util.List<java.util.concurrent.Future<?>> futures = new java.util.ArrayList<>();
+            for (int t = 0; t < threads; t++) {
+                final int thread = t;
+                futures.add(pool.submit(() -> {
+                    for (int j = 1; j <= perThread; j++) {
+                        long rowId = (long) thread * 10000 + j;
+                        tracker.track(MMSI, TABLE, rowId, "msg-" + rowId);
+                        tracker.inFlightCount(MMSI, TABLE);
+                        tracker.isTracked(MMSI, TABLE, rowId);
+                    }
+                    return null;
+                }));
+                futures.add(pool.submit(() -> {
+                    for (int j = 1; j <= perThread; j++) {
+                        long rowId = (long) thread * 10000 + j;
+                        tracker.onAck(MMSI, "msg-" + rowId, String.valueOf(rowId));
+                        tracker.watermark(MMSI, TABLE, 0L);
+                        tracker.resendDue(MMSI, TABLE, 30_000L);
+                    }
+                    return null;
+                }));
+            }
+            for (java.util.concurrent.Future<?> f : futures) {
+                f.get(60, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+
+        // 确定性收尾：单线程补齐所有 ACK，终态必须与单线程执行一致。
+        long maxId = (long) (threads - 1) * 10000 + perThread;
+        for (int t = 0; t < threads; t++) {
+            for (int j = 1; j <= perThread; j++) {
+                long rowId = (long) t * 10000 + j;
+                tracker.onAck(MMSI, "msg-" + rowId, String.valueOf(rowId));
+            }
+        }
+        assertEquals(maxId, tracker.watermark(MMSI, TABLE, 0L),
+                "全部 ACK 后 watermark 到达最大行号");
+        assertEquals(0, tracker.inFlightCount(MMSI, TABLE));
+        assertTrue(tracker.trackedCount(MMSI, TABLE) <= threads * perThread);
+    }
 }
