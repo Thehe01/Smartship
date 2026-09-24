@@ -69,6 +69,32 @@ class FileFallbackStoreTest {
     }
 
     @Test
+    @DisplayName("总量严格有界：低配置下实际占用不超过上限+一行")
+    void totalCapIsStrict() throws Exception {
+        FileFallbackStore store = new FileFallbackStore(tempDir, 1024L, 2048L);
+        String big = "x".repeat(800);
+        long droppedTotal = 0;
+        for (int i = 0; i < 12; i++) {
+            droppedTotal += store.spool("gps", "m", new Object[]{big});
+        }
+        long total = 0;
+        for (FileFallbackStore.PendingFile f : store.pendingFiles()) {
+            total += Files.size(f.path());
+        }
+        assertTrue(total <= 2048L + 1024L, "实际占用必须有界，实际=" + total);
+        assertTrue(droppedTotal > 0, "超限必须删旧行并计数");
+    }
+
+    @Test
+    @DisplayName("单行超总量上限直接拒收并计数，不建文件")
+    void oversizedSingleLineRefused() throws Exception {
+        FileFallbackStore store = new FileFallbackStore(tempDir, 1024L, 1024L);
+        assertEquals(1, store.spool("gps", "m", new Object[]{"x".repeat(2000)}),
+                "超大单行拒收计 1 行丢失");
+        assertTrue(store.pendingFiles().isEmpty(), "拒收不得建文件");
+    }
+
+    @Test
     @DisplayName("单文件上限按总量派生：低配置不撑爆，高配置不频繁滚动")
     void derivedMaxFileBytesBounds() {
         assertEquals(256L * 1024L, FileFallbackStore.derivedMaxFileBytes(1024L * 1024L),

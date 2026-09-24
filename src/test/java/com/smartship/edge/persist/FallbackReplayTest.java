@@ -173,4 +173,24 @@ class FallbackReplayTest {
                 "毒行保留供人工审计");
         assertEquals(0L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class));
     }
+
+    @Test
+    @DisplayName("毒行超限后多轮回放不再重复解析：稳定保留、主表始终为空")
+    void poisonRowStableAcrossCycles() {
+        JdbcTemplate jt = dbWithFallbackTable();
+        jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, payload, error) VALUES (?,?,?,?)",
+                "gps", "413999999", "not-json-at-all", "legacy");
+
+        EdgeProperties properties = new EdgeProperties();
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        FallbackReplayer replayer = new FallbackReplayer(jt, properties, new FileFallbackStore(tempDir, 1024L, 4096L), new SmartShipMetrics(registry));
+        for (int i = 0; i < 2 * FallbackReplayer.MAX_ROW_ATTEMPTS + 2; i++) {
+            replayer.replay();
+        }
+
+        assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class),
+                "超限毒行保留供人工审计");
+        assertEquals(0L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class),
+                "毒行永不污染主表");
+    }
 }

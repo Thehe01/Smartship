@@ -89,7 +89,12 @@ public class FallbackReplayer {
             if (used >= budget) {
                 break;
             }
+            // key 仅由 id 派生：超限行直接跳过，不再重复解析（解析本身每轮也有开销，
+            // 且未知流分支会重复计数丢失指标）。
             String key = "db:" + row.id();
+            if (overAttempted(key)) {
+                continue;
+            }
             final FileFallbackStore.ParsedLine parsed;
             try {
                 parsed = FileFallbackStore.parseLine(row.payload());
@@ -99,7 +104,11 @@ public class FallbackReplayer {
                 }
                 continue;
             }
-            if (overAttempted(key)) {
+            if (NmeaDataPersistenceService.sqlForStream(parsed.stream()) == null) {
+                if (noteAttempt(key)) {
+                    log.warn("[Fallback-Replay] 兜底表未知流跳过保留 (id={}, stream={})",
+                            row.id(), parsed.stream());
+                }
                 continue;
             }
             if (replayParsed(parsed.stream(), parsed.args())) {

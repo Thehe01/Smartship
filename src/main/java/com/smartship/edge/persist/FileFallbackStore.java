@@ -71,7 +71,7 @@ public class FileFallbackStore {
     public FileFallbackStore(Path dir, long maxFileBytes, long maxTotalBytes) {
         this.dir = dir;
         this.maxFileBytes = Math.max(1024L, maxFileBytes);
-        this.maxTotalBytes = Math.max(4096L, maxTotalBytes);
+        this.maxTotalBytes = Math.max(1024L, maxTotalBytes);
     }
 
     /** 待回放文件（最老优先），供回放器遍历。 */
@@ -87,15 +87,32 @@ public class FileFallbackStore {
     }
 
     /**
-     * 转存一行可回放记录。返回因总量超限而删掉的旧行数（调用方计数告警）。
+     * 转存一行可回放记录。返回本轮丢失行数（超限删除的旧行 + 超大单行拒收计 1，
+     * 调用方计数告警）。正常路径返回 0。
+     *
+     * <p>严格有界：写前先把总量（含 active 文件）+ 本行压到上限内——必要时先滚动
+     * active 使其参与清理；单行超过总量上限直接拒收。写后复检兜底。因此实际占用
+     * 永不超过 {@code maxTotalBytes + 一行}，而不是“上限 + 整个 active 文件”。
      */
     public synchronized long spool(String stream, String mmsi, Object[] args) throws IOException {
         Files.createDirectories(dir);
-        rotateIfNeeded();
         byte[] line = (argsToJson(stream, mmsi, args) + "\n").getBytes(StandardCharsets.UTF_8);
+        if (line.length > maxTotalBytes) {
+            log.warn("[Fallback] 单行 {} bytes 超总量上限 {}，拒绝写入并计数丢失",
+                    line.length, maxTotalBytes);
+            return 1;
+        }
+        rotateIfNeeded();
+        // 压力滚动：总量（含本行）已超限时先滚动 active，使其参与清理；
+        // 否则只剩 active 可写时实际占用会无界跟随 active 增长。
+        if (totalBytes() + line.length > maxTotalBytes) {
+            rotateActive();
+        }
+        long dropped = enforceTotalCap(line.length);
         Files.write(activeFile(), line,
                 StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.SYNC);
-        return enforceTotalCap();
+        dropped += enforceTotalCap(0);
+        return dropped;
     }
 
     /** 单行记录编码（文件 spool 与 DB 兜底表共用同一格式，保证两处都可回放）。 */
@@ -141,20 +158,42 @@ public class FileFallbackStore {
 
     /** 最老优先列出待回放文件（含当前 active 文件）。 */
     public synchronized List<PendingFile> pendingFiles() throws IOException {
+        return listDataFiles().stream()
+                .filter(p -> {
+                    try {
+                        return Files.size(p) > 0;
+                    } catch (IOException e) {
+                        return false;
+                    }
+                })
+                .map(PendingFile::new)
+                .toList();
+    }
+
+    /** 全部 spool 数据文件（rotated 优先、active 最后；隐藏 .tmp 中间文件）。 */
+    private List<Path> listDataFiles() throws IOException {
         if (!Files.isDirectory(dir)) {
             return List.of();
         }
         List<Path> files = new ArrayList<>();
         try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir, "*.jsonl")) {
             for (Path p : ds) {
-                if (Files.isRegularFile(p) && Files.size(p) > 0) {
+                if (Files.isRegularFile(p)) {
                     files.add(p);
                 }
             }
         }
         files.sort(Comparator.comparing((Path p) -> p.getFileName().toString().startsWith("failed-writes-") ? 0 : 1)
                 .thenComparing(p -> p.getFileName().toString()));
-        return files.stream().map(PendingFile::new).toList();
+        return files;
+    }
+
+    private long totalBytes() throws IOException {
+        long total = 0;
+        for (Path p : listDataFiles()) {
+            total += Files.size(p);
+        }
+        return total;
     }
 
     /** 读出文件全部行并解析；坏行跳过并计数返回（调用方可告警）。 */
@@ -269,39 +308,60 @@ public class FileFallbackStore {
     private void rotateIfNeeded() throws IOException {
         Path active = activeFile();
         if (Files.exists(active) && Files.size(active) >= maxFileBytes) {
-            Path rotated = dir.resolve("failed-writes-"
-                    + java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS")
-                            .format(LocalDateTime.now()) + ".jsonl");
-            Files.move(active, rotated, StandardCopyOption.ATOMIC_MOVE);
-            log.info("[Fallback] spool 滚动: {} ({} bytes)", rotated.getFileName(), Files.size(rotated));
+            rotateActive();
         }
     }
 
-    /** 总量超限删最老文件，返回删掉的行数估计。 */
-    private long enforceTotalCap() throws IOException {
-        List<PendingFile> files = pendingFiles();
-        long total = 0;
-        for (PendingFile f : files) {
-            total += Files.size(f.path());
+    private void rotateActive() throws IOException {
+        Path active = activeFile();
+        if (!Files.exists(active) || Files.size(active) == 0) {
+            return;
         }
+        Path rotated = dir.resolve("failed-writes-"
+                + java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS")
+                        .format(LocalDateTime.now()) + ".jsonl");
+        Files.move(active, rotated, StandardCopyOption.ATOMIC_MOVE);
+        log.info("[Fallback] spool 滚动: {} ({} bytes)", rotated.getFileName(), Files.size(rotated));
+    }
+
+    /**
+     * 总量预检（含 active 文件 + 即将写入的字节）：删最老非 active 文件直到 fits。
+     * active 文件永不直接删除——压力过大时调用方应先 {@link #rotateActive}。
+     */
+    private long enforceTotalCap(long incomingBytes) throws IOException {
         long dropped = 0;
-        for (PendingFile f : files) {
-            if (total <= maxTotalBytes) {
-                break;
+        while (true) {
+            List<Path> files = listDataFiles();
+            long total = 0;
+            for (Path p : files) {
+                total += Files.size(p);
             }
-            if (f.path().getFileName().toString().equals(ACTIVE_FILE)) {
-                continue;
+            if (total + incomingBytes <= maxTotalBytes) {
+                return dropped;
+            }
+            Path victim = null;
+            for (Path p : files) {
+                if (!p.getFileName().toString().equals(ACTIVE_FILE)) {
+                    victim = p;
+                    break;
+                }
+            }
+            if (victim == null) {
+                return dropped;
             }
             // 先取值再删：delete 后再 Files.size 会抛 NoSuchFileException。
-            long size = Files.size(f.path());
-            long lines = countLines(f.path());
-            Files.deleteIfExists(f.path());
-            total -= size;
+            long size = Files.size(victim);
+            long lines = countLines(victim);
+            Files.deleteIfExists(victim);
             dropped += lines;
-            log.warn("[Fallback] 磁盘超限删除最老 spool 文件: {} (约 {} 行)",
-                    f.path().getFileName(), lines);
+            log.warn("[Fallback] 磁盘超限删除最老 spool 文件: {} (约 {} 行, {} bytes)",
+                    victim.getFileName(), lines, size);
         }
-        return dropped;
+    }
+
+    /** 历史兼容：无预检的复检（写后兜底）。 */
+    private long enforceTotalCap() throws IOException {
+        return enforceTotalCap(0);
     }
 
     private static long countLines(Path p) {
