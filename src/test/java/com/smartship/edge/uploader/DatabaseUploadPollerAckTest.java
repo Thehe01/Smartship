@@ -1,7 +1,6 @@
 package com.smartship.edge.uploader;
 
 import com.smartship.edge.config.EdgeProperties;
-import com.smartship.edge.routing.ShipDataSourceManager;
 import com.smartship.edge.uploader.mqtt.MqttPublisher;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -37,7 +36,7 @@ class DatabaseUploadPollerAckTest {
     private MqttPublisher publisher;
     private UploadAckTracker tracker;
     private DatabaseUploadPoller poller;
-    private ShipDataSourceManager.ShipDatabase ship;
+    private DatabaseUploadPoller.LocalShip ship;
 
     @BeforeEach
     void setUp() {
@@ -68,10 +67,9 @@ class DatabaseUploadPollerAckTest {
         when(publisher.getClientManager())
                 .thenReturn(mock(com.smartship.edge.uploader.mqtt.MqttClientManager.class));
         tracker = new UploadAckTracker();
-        poller = new DatabaseUploadPoller(properties, mock(ShipDataSourceManager.class),
+        poller = new DatabaseUploadPoller(properties, jdbc,
                 publisher, null, null, tracker);
-        ship = new ShipDataSourceManager.ShipDatabase(
-                "S001", MMSI, "zncb_auth", "localhost", 3306, "root", "123456", true);
+        ship = new DatabaseUploadPoller.LocalShip("S001", MMSI);
     }
 
     @AfterEach
@@ -155,7 +153,7 @@ class DatabaseUploadPollerAckTest {
         // 重启 = 新跟踪器 + 新 poller，游标表持久化了，H2 同库。
         UploadAckTracker freshTracker = new UploadAckTracker();
         DatabaseUploadPoller freshPoller = new DatabaseUploadPoller(properties,
-                mock(ShipDataSourceManager.class), publisher, null, null, freshTracker);
+                jdbc, publisher, null, null, freshTracker);
         insertRows(1003);
         clearInvocations(publisher);
 

@@ -3,7 +3,7 @@ package com.smartship.edge.collect.nmea.parser;
 import com.smartship.edge.collect.nmea.service.NmeaDataHandler;
 import com.smartship.edge.config.EdgeProperties;
 import com.smartship.edge.config.MmsiPersistence;
-import com.smartship.edge.routing.ShipAutoRegisterService;
+import com.smartship.edge.routing.ShipLocalInitializer;
 import com.smartship.edge.routing.service.NmeaDataPersistenceService;
 import com.smartship.edge.uploader.mqtt.MqttClientManager;
 import jakarta.annotation.PostConstruct;
@@ -29,7 +29,7 @@ public class NmeaParser {
     private final NmeaDataHandler dataHandler;
     private final NmeaDataPersistenceService persistenceService;
     private final EdgeProperties properties;
-    private final ShipAutoRegisterService shipAutoRegisterService;
+    private final ShipLocalInitializer shipAutoRegisterService;
     private final MqttClientManager mqttClientManager;
 
     private String staticConfiguredMmsi;

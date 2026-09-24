@@ -1,6 +1,6 @@
 -- ======================================================================
--- 船舶独立业务数据库表结构（由 ShipAutoRegisterService 自动向目标船库刷入）
--- 注意：本文件仅包含分船业务遥测表与游标表，主库元数据位于 auth-schema.sql
+-- 本船业务数据库表结构（单船单库，由 ShipLocalInitializer 在启动/发现 MMSI 时自建）
+-- 注意：船端只存本船数据，分船（按 mmsi 区分）在岸端完成
 -- ======================================================================
 
 -- 1. 导航 GPS 综合流表
@@ -108,3 +108,14 @@ CREATE TABLE IF NOT EXISTS zncb_upload_cursor (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (stream_name, partition_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='本地到云端上报游标断点表';
+
+-- 7. 本地写入兜底表：主表重试耗尽后转存，待人工/定时任务回放
+CREATE TABLE IF NOT EXISTS zncb_failed_writes (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    stream VARCHAR(32) NOT NULL COMMENT '遥测流 gps/wind/depth/rudder/engine',
+    mmsi VARCHAR(32) NOT NULL COMMENT '本船 MMSI',
+    payload TEXT COMMENT '截断后的行参数',
+    error VARCHAR(500) COMMENT '最终失败原因',
+    create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_stream_ts (stream, create_time)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='本地持久化兜底表';

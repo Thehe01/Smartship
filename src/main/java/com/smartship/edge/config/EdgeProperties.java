@@ -14,7 +14,6 @@ public class EdgeProperties {
     private volatile boolean schemaReady = false;
 
     private Collect collect = new Collect();
-    private Datasource datasource = new Datasource();
     private Uploader uploader = new Uploader();
 
     @Data
@@ -71,23 +70,6 @@ public class EdgeProperties {
     public static class UdpConfig {
         private boolean enabled = false;
         private int port = 9002;
-    }
-
-    @Data
-    public static class Datasource {
-        private ShipShipDataSourceProperties ship = new ShipShipDataSourceProperties();
-    }
-
-    @Data
-    public static class ShipShipDataSourceProperties {
-        private String defaultHost = "localhost";
-        private int defaultPort = 3306;
-        private String defaultUsername = "root";
-        private String defaultPassword = "123456";
-        private int maximumPoolSize = 5;
-        private String jdbcParams = "useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false";
-        private String driverClassName = "";
-        private long registryValidationIntervalMs = 5000L;
     }
 
     @Data

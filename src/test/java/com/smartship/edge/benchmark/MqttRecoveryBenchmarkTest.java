@@ -3,7 +3,6 @@ package com.smartship.edge.benchmark;
 import com.smartship.edge.benchmark.simulator.FaultInjectingMqttGateway;
 import com.smartship.edge.benchmark.support.BenchmarkFixtures;
 import com.smartship.edge.config.EdgeProperties;
-import com.smartship.edge.routing.ShipDataSourceManager;
 import com.smartship.edge.uploader.DatabaseUploadPoller;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.DisplayName;
@@ -58,7 +57,7 @@ class MqttRecoveryBenchmarkTest {
         final JdbcTemplate jt;
         final DatabaseUploadPoller poller;
         final DatabaseUploadPoller.IncrementalStream stream;
-        final ShipDataSourceManager.ShipDatabase ship;
+        final DatabaseUploadPoller.LocalShip ship;
         final FaultInjectingMqttGateway gateway;
 
         Fixture(int rows, int batchSize) {
@@ -83,12 +82,8 @@ class MqttRecoveryBenchmarkTest {
             properties.getUploader().setEnabled(true);
             properties.getUploader().getPoll().setBatchSize(batchSize);
             gateway = new FaultInjectingMqttGateway();
-            ShipDataSourceManager manager = mock(ShipDataSourceManager.class);
-            ship = new ShipDataSourceManager.ShipDatabase(
-                    SHIP_ID, MMSI, "mqtt_bench_db", "localhost", 3306, "sa", "", true);
-            when(manager.listEnabledRegistries()).thenReturn(List.of(ship));
-            when(manager.getJdbcTemplate(any(), any())).thenReturn(jt);
-            poller = new DatabaseUploadPoller(properties, manager, gateway.publisher());
+            ship = new DatabaseUploadPoller.LocalShip(SHIP_ID, MMSI);
+            poller = new DatabaseUploadPoller(properties, jt, gateway.publisher());
             stream = new DatabaseUploadPoller.IncrementalStream("gps", TABLE, "nmea_gps", "nmea_gps");
         }
 
@@ -197,13 +192,11 @@ class MqttRecoveryBenchmarkTest {
             }
         };
 
-        ShipDataSourceManager manager = mock(ShipDataSourceManager.class);
-        when(manager.getJdbcTemplate(any(), any())).thenReturn(crashOnceJt);
-        EdgeProperties properties = new EdgeProperties();
-        properties.getUploader().setEnabled(true);
-        properties.getUploader().getPoll().setBatchSize(500);
+        EdgeProperties crashProperties = new EdgeProperties();
+        crashProperties.getUploader().setEnabled(true);
+        crashProperties.getUploader().getPoll().setBatchSize(500);
         DatabaseUploadPoller crashingPoller =
-                new DatabaseUploadPoller(properties, manager, f.gateway.publisher());
+                new DatabaseUploadPoller(crashProperties, crashOnceJt, f.gateway.publisher());
 
         // 第一次：500 条 publish 成功，cursor 提交失败
         crashingPoller.uploadIncrementalStream(crashOnceJt, f.ship, f.stream);
@@ -215,7 +208,7 @@ class MqttRecoveryBenchmarkTest {
 
         // 第二次：同样 poller、全量重跑，id=1 的 msg_id 必须与第一次完全相同
         DatabaseUploadPoller recoveredPoller =
-                new DatabaseUploadPoller(properties, manager, f.gateway.publisher());
+                new DatabaseUploadPoller(crashProperties, crashOnceJt, f.gateway.publisher());
         int rounds = 0;
         while (f.cursor() < rows && rounds < 50) {
             recoveredPoller.uploadIncrementalStream(crashOnceJt, f.ship, f.stream);

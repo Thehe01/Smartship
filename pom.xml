@@ -31,6 +31,20 @@
         <benchmark.persistence.latencyMs>5,25</benchmark.persistence.latencyMs>
         <benchmark.ships>1,10,50</benchmark.ships>
         <benchmark.mqtt.rows>10000</benchmark.mqtt.rows>
+        <benchmark.highconcurrency.tasks>10000</benchmark.highconcurrency.tasks>
+        <benchmark.highconcurrency.latencyMs>1</benchmark.highconcurrency.latencyMs>
+        <benchmark.highconcurrency.ships>50</benchmark.highconcurrency.ships>
+        <benchmark.batch.rows>10000</benchmark.batch.rows>
+        <benchmark.batch.size>500</benchmark.batch.size>
+        <benchmark.batch.ships>50</benchmark.batch.ships>
+        <benchmark.sustained.rows>10000</benchmark.sustained.rows>
+        <benchmark.sustained.ratePerSec>2500</benchmark.sustained.ratePerSec>
+        <benchmark.sustained.ships>50</benchmark.sustained.ships>
+        <benchmark.sustained.batch>100</benchmark.sustained.batch>
+        <benchmark.outage.rows>750000</benchmark.outage.rows>
+        <benchmark.outage.pollBatch>10000</benchmark.outage.pollBatch>
+        <benchmark.outage.failAfter>100000</benchmark.outage.failAfter>
+        <benchmark.outage.warmupRows>5000</benchmark.outage.warmupRows>
     </properties>
 
     <dependencies>
@@ -160,6 +174,20 @@
                                 <benchmark.persistence.latencyMs>${benchmark.persistence.latencyMs}</benchmark.persistence.latencyMs>
                                 <benchmark.ships>${benchmark.ships}</benchmark.ships>
                                 <benchmark.mqtt.rows>${benchmark.mqtt.rows}</benchmark.mqtt.rows>
+                                <benchmark.highconcurrency.tasks>${benchmark.highconcurrency.tasks}</benchmark.highconcurrency.tasks>
+                                <benchmark.highconcurrency.latencyMs>${benchmark.highconcurrency.latencyMs}</benchmark.highconcurrency.latencyMs>
+                                <benchmark.highconcurrency.ships>${benchmark.highconcurrency.ships}</benchmark.highconcurrency.ships>
+                                <benchmark.batch.rows>${benchmark.batch.rows}</benchmark.batch.rows>
+                                <benchmark.batch.size>${benchmark.batch.size}</benchmark.batch.size>
+                                <benchmark.batch.ships>${benchmark.batch.ships}</benchmark.batch.ships>
+                                <benchmark.sustained.rows>${benchmark.sustained.rows}</benchmark.sustained.rows>
+                                <benchmark.sustained.ratePerSec>${benchmark.sustained.ratePerSec}</benchmark.sustained.ratePerSec>
+                                <benchmark.sustained.ships>${benchmark.sustained.ships}</benchmark.sustained.ships>
+                                <benchmark.sustained.batch>${benchmark.sustained.batch}</benchmark.sustained.batch>
+                                <benchmark.outage.rows>${benchmark.outage.rows}</benchmark.outage.rows>
+                                <benchmark.outage.pollBatch>${benchmark.outage.pollBatch}</benchmark.outage.pollBatch>
+                                <benchmark.outage.failAfter>${benchmark.outage.failAfter}</benchmark.outage.failAfter>
+                                <benchmark.outage.warmupRows>${benchmark.outage.warmupRows}</benchmark.outage.warmupRows>
                             </systemPropertyVariables>
                         </configuration>
                     </plugin>

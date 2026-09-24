@@ -1,71 +1,94 @@
 package com.smartship.edge.observability;
 
-import com.smartship.edge.routing.PoolSnapshot;
-import com.smartship.edge.routing.ShipDataSourceManager;
+import com.zaxxer.hikari.HikariDataSource;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.binder.MeterBinder;
-import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
-import java.util.List;
+import javax.sql.DataSource;
 
 /**
- * 动态分船 HikariCP 连接池全局聚合 Gauge 绑定器
- * <p>
- * 通过 ShipDataSourceManager.listPoolSnapshots() 计算全局聚合指标，
- * 避免对每个 MMSI 动态生成独立 Label 产生高基数（High Cardinality）问题。
+ * 单船单库 HikariCP 连接池 Gauge 绑定器（无分船路由）。
+ *
+ * <p>船端只有一个本地库：指标直接取自单 {@link DataSource}，不再聚合多池、
+ * 不再使用 MMSI 标签，彻底规避高基数问题。
  */
 @Component
-@RequiredArgsConstructor
 public class DataSourceMetricsBinder implements MeterBinder {
 
-    private final ShipDataSourceManager shipDataSourceManager;
+    private final DataSource dataSource;
+
+    public DataSourceMetricsBinder(DataSource dataSource) {
+        this.dataSource = dataSource;
+    }
 
     @Override
     public void bindTo(MeterRegistry registry) {
-        Gauge.builder("smartship_datasource_pool_count", this, DataSourceMetricsBinder::getPoolCount)
-                .description("Total number of dynamic HikariCP pools")
+        Gauge.builder("smartship_datasource_pool_count", this, b -> 1.0)
+                .description("Single local HikariCP pool")
                 .register(registry);
 
-        Gauge.builder("smartship_datasource_connections_total", this, DataSourceMetricsBinder::getTotalConnections)
-                .description("Total connections across all dynamic HikariCP pools")
+        Gauge.builder("smartship_datasource_connections_total", this, b -> (double) b.getTotalConnections())
+                .description("Total connections of the local HikariCP pool")
                 .register(registry);
 
-        Gauge.builder("smartship_datasource_connections_active", this, DataSourceMetricsBinder::getActiveConnections)
-                .description("Active connections across all dynamic HikariCP pools")
+        Gauge.builder("smartship_datasource_connections_active", this, b -> (double) b.getActiveConnections())
+                .description("Active connections of the local HikariCP pool")
                 .register(registry);
 
-        Gauge.builder("smartship_datasource_connections_idle", this, DataSourceMetricsBinder::getIdleConnections)
-                .description("Idle connections across all dynamic HikariCP pools")
+        Gauge.builder("smartship_datasource_connections_idle", this, b -> (double) b.getIdleConnections())
+                .description("Idle connections of the local HikariCP pool")
                 .register(registry);
 
-        Gauge.builder("smartship_datasource_threads_pending", this, DataSourceMetricsBinder::getPendingThreads)
-                .description("Threads awaiting connection across all dynamic HikariCP pools")
+        Gauge.builder("smartship_datasource_threads_pending", this, b -> (double) b.getPendingThreads())
+                .description("Threads awaiting connection of the local HikariCP pool")
                 .register(registry);
     }
 
     public int getPoolCount() {
-        return getSnapshots().size();
+        return 1;
     }
 
     public int getTotalConnections() {
-        return getSnapshots().stream().mapToInt(PoolSnapshot::getTotalConnections).sum();
+        return poolStat(Bean::getTotalConnections);
     }
 
     public int getActiveConnections() {
-        return getSnapshots().stream().mapToInt(PoolSnapshot::getActiveConnections).sum();
+        return poolStat(Bean::getActiveConnections);
     }
 
     public int getIdleConnections() {
-        return getSnapshots().stream().mapToInt(PoolSnapshot::getIdleConnections).sum();
+        return poolStat(Bean::getIdleConnections);
     }
 
     public int getPendingThreads() {
-        return getSnapshots().stream().mapToInt(PoolSnapshot::getPendingThreads).sum();
+        return poolStat(Bean::getThreadsAwaitingConnection);
     }
 
-    private List<PoolSnapshot> getSnapshots() {
-        return shipDataSourceManager.listPoolSnapshots();
+    private interface Bean {
+        int getTotalConnections();
+        int getActiveConnections();
+        int getIdleConnections();
+        int getThreadsAwaitingConnection();
+    }
+
+    private int poolStat(java.util.function.ToIntFunction<Bean> f) {
+        try {
+            if (dataSource instanceof HikariDataSource hikari && !hikari.isClosed()
+                    && hikari.getHikariPoolMXBean() != null) {
+                var mx = hikari.getHikariPoolMXBean();
+                Bean b = new Bean() {
+                    public int getTotalConnections() { return mx.getTotalConnections(); }
+                    public int getActiveConnections() { return mx.getActiveConnections(); }
+                    public int getIdleConnections() { return mx.getIdleConnections(); }
+                    public int getThreadsAwaitingConnection() { return mx.getThreadsAwaitingConnection(); }
+                };
+                return f.applyAsInt(b);
+            }
+        } catch (Exception ignored) {
+            // 池关闭/过渡期降级为 0
+        }
+        return 0;
     }
 }

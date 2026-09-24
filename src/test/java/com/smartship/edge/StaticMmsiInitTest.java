@@ -3,7 +3,7 @@ package com.smartship.edge;
 import com.smartship.edge.collect.nmea.parser.NmeaParser;
 import com.smartship.edge.collect.nmea.service.NmeaDataHandler;
 import com.smartship.edge.config.EdgeProperties;
-import com.smartship.edge.routing.ShipAutoRegisterService;
+import com.smartship.edge.routing.ShipLocalInitializer;
 import com.smartship.edge.routing.service.NmeaDataPersistenceService;
 import com.smartship.edge.uploader.mqtt.MqttClientManager;
 import org.junit.jupiter.api.DisplayName;
@@ -24,7 +24,7 @@ class StaticMmsiInitTest {
     private NmeaDataPersistenceService persistenceService;
 
     @Mock
-    private ShipAutoRegisterService shipAutoRegisterService;
+    private ShipLocalInitializer shipAutoRegisterService;
 
     @Mock
     private MqttClientManager mqttClientManager;

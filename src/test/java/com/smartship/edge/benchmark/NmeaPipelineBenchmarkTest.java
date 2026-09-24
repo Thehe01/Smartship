@@ -7,10 +7,9 @@ import com.smartship.edge.collect.nmea.parser.NmeaParser;
 import com.smartship.edge.collect.nmea.service.NmeaDataHandler;
 import com.smartship.edge.config.EdgeProperties;
 import com.smartship.edge.routing.PersistenceThrottle;
-import com.smartship.edge.routing.ShipDataSourceManager;
 import com.smartship.edge.routing.service.NmeaDataPersistenceService;
 import com.smartship.edge.uploader.mqtt.MqttClientManager;
-import com.smartship.edge.routing.ShipAutoRegisterService;
+import com.smartship.edge.routing.ShipLocalInitializer;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
@@ -85,14 +84,12 @@ class NmeaPipelineBenchmarkTest {
             properties.getCollect().getPersist().setEnabled(true);
             properties.getCollect().getPersist().setMinWriteIntervalSeconds(throttleSeconds);
 
-            ShipDataSourceManager manager = mock(ShipDataSourceManager.class);
-            when(manager.getJdbcTemplate(any(), eq(MMSI))).thenReturn(jt);
             NmeaDataPersistenceService real =
-                    new NmeaDataPersistenceService(manager, properties, new PersistenceThrottle(properties));
+                    new NmeaDataPersistenceService(jt, properties, new PersistenceThrottle(properties));
             persistSpy = spy(real);
             NmeaDataHandler handler = new NmeaDataHandler(persistSpy, new PersistenceThrottle(properties));
             parser = new NmeaParser(handler, persistSpy, properties,
-                    mock(ShipAutoRegisterService.class), mock(MqttClientManager.class));
+                    mock(ShipLocalInitializer.class), mock(MqttClientManager.class));
         }
 
         long attempts(String method) {

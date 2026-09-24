@@ -24,6 +24,10 @@ import java.util.TreeMap;
  * 核心架构特性：
  * 1. 确定性稳定消息 ID（msg_id）：以业务自然主键与时间戳绑定计算 SHA-256 哈希，杜绝随机 UUID，为岸端提供天然幂等去重基石
  * 2. 统一上报主题规范：zncb/{mmsi}/{topicSuffix}
+ * <p>
+ * 线路协议契约 <b>edge-mqtt-contract-v1</b>（主题格式、msg_id 规范算法、载荷键）由
+ * {@code MqttPublisherContractTest}（本仓）与岸仓 {@code EdgeContractPinTest} 双边冻结：
+ * 改算法必须同步 bump 两边，单边绿不代表兼容。
  */
 @Slf4j
 @Component
@@ -45,6 +49,11 @@ public class MqttPublisher {
         return mqttClientManager;
     }
 
+    /** 上报主题规范（契约 v1 的一部分，双边冻结，改格式必须同步 bump 岸仓）。 */
+    public static String topicFor(String mmsi, String topicSuffix) {
+        return "zncb/" + mmsi + "/" + topicSuffix;
+    }
+
     public boolean publish(String mmsi, String type, String topicSuffix, Map<String, Object> row) {
         Map<String, Object> payload = new LinkedHashMap<>(row);
         payload.put("mmsi", mmsi);
@@ -59,7 +68,7 @@ public class MqttPublisher {
         payload.put("sent_at", ZonedDateTime.now(ZoneOffset.ofHours(8)).format(TIME_FMT));
 
         try {
-            String topic = "zncb/" + mmsi + "/" + topicSuffix;
+            String topic = topicFor(mmsi, topicSuffix);
             return mqttClientManager.publish(topic, MAPPER.writeValueAsBytes(payload));
         } catch (Exception e) {
             log.warn("[MQTT-Pub] 序列化/发送失败: type={}, mmsi={}, err={}", type, mmsi, e.getMessage());

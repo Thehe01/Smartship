@@ -5,8 +5,8 @@ spring:
   application:
     name: smartship-edge-core
   datasource:
-    # 船端主认证与船舶元数据注册库
-    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3306}/zncb_auth?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
+    # 船端单库：只存本船数据（表结构见 schema/ship-schema.sql），分船在岸端按 mmsi 完成
+    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3306}/${MYSQL_DB:zncb_ship}?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
     username: ${MYSQL_USER:root}
     password: ${MYSQL_PASS:123456}
     driver-class-name: com.mysql.cj.jdbc.Driver
@@ -65,17 +65,6 @@ smartship:
         udp:
           enabled: false
           port: 9002
-
-    # [模块三] 动态分船数据库路由配置
-    datasource:
-      ship:
-        default-host: "localhost"
-        default-port: 3306
-        default-username: "root"
-        default-password: "123456"
-        maximum-pool-size: 5         # 边缘工控机配额约束
-        jdbc-params: "useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false"
-        registry-validation-interval-ms: 5000 # 动态分船注册信息轻量 TTL 校验周期（毫秒）
 
     # [模块四] MQTT 上报链路配置
     uploader:

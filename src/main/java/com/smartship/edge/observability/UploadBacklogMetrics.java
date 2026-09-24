@@ -1,6 +1,5 @@
 package com.smartship.edge.observability;
 
-import com.smartship.edge.routing.ShipDataSourceManager;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.binder.MeterBinder;
@@ -14,11 +13,11 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 边端待上传积压指标管理器
- * <p>
- * 统计所有已启用船舶及所有 telemetry 数据流的总积压记录数：
+ * 边端待上传积压指标管理器（单船单库）。
+ *
+ * <p>统计本船各 telemetry 数据流的总积压记录数：
  * backlog = MAX(table.id) - last_uploaded_id
- * 异常降级保证：查询失败时不将指标置 0，安全保留上一次有效采样值；杜绝 MMSI 高基数 Label。
+ * 异常降级保证：查询失败时不将指标置 0，安全保留上一次有效采样值。
  */
 @Slf4j
 @Component
@@ -33,13 +32,13 @@ public class UploadBacklogMetrics implements MeterBinder {
             "zncb_engine_data"
     );
 
-    private final ShipDataSourceManager shipDataSourceManager;
+    private final JdbcTemplate jdbcTemplate;
     private final AtomicLong lastKnownBacklog = new AtomicLong(0L);
 
     @Override
     public void bindTo(MeterRegistry registry) {
         Gauge.builder("smartship_uploader_backlog_rows", this, UploadBacklogMetrics::getBacklogRows)
-                .description("Total backlog rows pending upload across all enabled ships and telemetry streams")
+                .description("Total backlog rows pending upload for the local ship database")
                 .register(registry);
     }
 
@@ -49,22 +48,11 @@ public class UploadBacklogMetrics implements MeterBinder {
 
     public synchronized void refresh() {
         try {
-            List<ShipDataSourceManager.ShipDatabase> ships = shipDataSourceManager.listEnabledRegistries();
-            if (ships.isEmpty()) {
-                lastKnownBacklog.set(0L);
-                return;
-            }
-
             long sampledBacklog = 0L;
-            for (ShipDataSourceManager.ShipDatabase ship : ships) {
-                JdbcTemplate jt = shipDataSourceManager.getJdbcTemplate(ship.shipId(), ship.mmsi());
-                for (String table : TELEMETRY_TABLES) {
-                    sampledBacklog += calculateTableBacklog(jt, table);
-                }
+            for (String table : TELEMETRY_TABLES) {
+                sampledBacklog += calculateTableBacklog(jdbcTemplate, table);
             }
             lastKnownBacklog.set(sampledBacklog);
-        } catch (com.smartship.edge.routing.exception.RegistryQueryException e) {
-            log.warn("[Observability] 船舶注册库查询异常，保留上一轮 backlog {}: {}", lastKnownBacklog.get(), e.getMessage());
         } catch (Exception e) {
             log.warn("[Observability] 计算上传 backlog 异常，保留上一轮 backlog {}: {}", lastKnownBacklog.get(), e.getMessage());
         }

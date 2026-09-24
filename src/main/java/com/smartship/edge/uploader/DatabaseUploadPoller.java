@@ -3,29 +3,31 @@ package com.smartship.edge.uploader;
 import com.smartship.edge.config.EdgeProperties;
 import com.smartship.edge.observability.SmartShipMetrics;
 import com.smartship.edge.observability.UploadBacklogMetrics;
-import com.smartship.edge.routing.ShipDataSourceManager;
 import com.smartship.edge.uploader.mqtt.MqttPublisher;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.Timestamp;
-import java.time.LocalDateTime;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * 边端数据库增量轮询上传引擎
- * <p>
- * 核心架构特性：
- * 1. 本地游标驱动：以 zncb_upload_cursor 记录每张表的最后推送断点 (last_uploaded_id / last_uploaded_time)
- * 2. 失败短路保护：一旦单条消息发送失败（如断网或弱网），坚决执行 break 暂停批次，冻结游标在断点处，恢复后自动续查
- * 3. 统计增量上报 rows_total 与 batches_total 指标，游标语义严格不变
+ * 边端数据库增量轮询上传引擎（单船单库，无分船路由）。
+ *
+ * <p>船端只存本船数据：唯一数据源即 Spring 默认单数据源（本地本船库）。
+ * 本船身份来自 {@link EdgeProperties#getMmsi()} / {@code getShipId()}，
+ * 分船（按 {@code mmsi} 区分）在岸端完成。
+ *
+ * <p>核心语义保持不变：
+ * 1. 本地游标驱动：以 zncb_upload_cursor 记录每张表的最后推送断点
+ * 2. 失败短路保护：单条发送失败即 break 冻结游标
  */
 @Slf4j
 @Service
@@ -48,6 +50,9 @@ public class DatabaseUploadPoller {
 
     public record SnapshotStream(String tableName, String type, String topicSuffix, String orderColumn) {}
 
+    /** 本船身份（单船模式）：仅 mmsi + shipId，不再有 databaseName/host/port。 */
+    public record LocalShip(String shipId, String mmsi) {}
+
     private static final List<IncrementalStream> TELEMETRY_STREAMS = List.of(
             new IncrementalStream("gps", "zncb_gps_data", "nmea_gps", "nmea_gps"),
             new IncrementalStream("wind", "zncb_wind_data", "nmea_wind", "nmea_wind"),
@@ -57,7 +62,7 @@ public class DatabaseUploadPoller {
     );
 
     private final EdgeProperties properties;
-    private final ShipDataSourceManager shipDataSourceManager;
+    private final JdbcTemplate jdbcTemplate;
     private final MqttPublisher mqttPublisher;
     private final SmartShipMetrics metrics;
     private final UploadBacklogMetrics backlogMetrics;
@@ -65,22 +70,22 @@ public class DatabaseUploadPoller {
 
     @Autowired
     public DatabaseUploadPoller(EdgeProperties properties,
-                                ShipDataSourceManager shipDataSourceManager,
+                                JdbcTemplate jdbcTemplate,
                                 MqttPublisher mqttPublisher,
                                 SmartShipMetrics metrics,
                                 UploadBacklogMetrics backlogMetrics) {
-        this(properties, shipDataSourceManager, mqttPublisher, metrics, backlogMetrics,
+        this(properties, jdbcTemplate, mqttPublisher, metrics, backlogMetrics,
                 new UploadAckTracker());
     }
 
     public DatabaseUploadPoller(EdgeProperties properties,
-                                ShipDataSourceManager shipDataSourceManager,
+                                JdbcTemplate jdbcTemplate,
                                 MqttPublisher mqttPublisher,
                                 SmartShipMetrics metrics,
                                 UploadBacklogMetrics backlogMetrics,
                                 UploadAckTracker ackTracker) {
         this.properties = properties;
-        this.shipDataSourceManager = shipDataSourceManager;
+        this.jdbcTemplate = jdbcTemplate;
         this.mqttPublisher = mqttPublisher;
         this.metrics = metrics;
         this.backlogMetrics = backlogMetrics;
@@ -90,6 +95,12 @@ public class DatabaseUploadPoller {
             this.mqttPublisher.getClientManager().setAckListener((topic, msgId, seq) ->
                     ackTracker.onAck(extractMmsi(topic), msgId, seq));
         }
+    }
+
+    public DatabaseUploadPoller(EdgeProperties properties,
+                                JdbcTemplate jdbcTemplate,
+                                MqttPublisher mqttPublisher) {
+        this(properties, jdbcTemplate, mqttPublisher, null, null);
     }
 
     /** 测试观察：直接驱动 ACK 流转，无需真实 Broker。 */
@@ -105,10 +116,15 @@ public class DatabaseUploadPoller {
         return parts.length >= 2 ? parts[1] : "";
     }
 
-    public DatabaseUploadPoller(EdgeProperties properties,
-                                ShipDataSourceManager shipDataSourceManager,
-                                MqttPublisher mqttPublisher) {
-        this(properties, shipDataSourceManager, mqttPublisher, null, null);
+    private LocalShip currentShip() {
+        String mmsi = properties.getMmsi() != null ? properties.getMmsi().trim() : "";
+        String shipId = properties.getShipId();
+        if (!StringUtils.hasText(shipId)) {
+            shipId = mmsi;
+        } else {
+            shipId = shipId.trim();
+        }
+        return new LocalShip(shipId, mmsi);
     }
 
     @Scheduled(
@@ -120,30 +136,24 @@ public class DatabaseUploadPoller {
             return;
         }
 
-        List<ShipDataSourceManager.ShipDatabase> ships;
-        try {
-            ships = shipDataSourceManager.listEnabledRegistries();
-        } catch (Exception e) {
-            log.warn("[Uploader] 获取可用船舶列表异常: {}", e.getMessage());
-            ships = List.of();
+        LocalShip ship = currentShip();
+        if (!StringUtils.hasText(ship.mmsi())) {
+            log.debug("[Uploader] 本船 MMSI 尚未就绪，跳过本轮上传");
+            return;
         }
-
-        for (ShipDataSourceManager.ShipDatabase ship : ships) {
-            try {
-                JdbcTemplate jdbcTemplate = shipDataSourceManager.getJdbcTemplate(ship.shipId(), ship.mmsi());
-                ensureCursorTable(jdbcTemplate);
-                for (IncrementalStream stream : TELEMETRY_STREAMS) {
-                    uploadIncrementalStream(jdbcTemplate, ship, stream);
-                }
-            } catch (Exception e) {
-                if (metrics != null) {
-                    for (IncrementalStream stream : TELEMETRY_STREAMS) {
-                        metrics.recordUploadBatch(stream.streamKey(), false);
-                    }
-                }
-                log.warn("[Uploader] 轮询推送异常: shipId={}, mmsi={}, err={}",
-                        ship.shipId(), ship.mmsi(), e.getMessage());
+        try {
+            ensureCursorTable(jdbcTemplate);
+            for (IncrementalStream stream : TELEMETRY_STREAMS) {
+                uploadIncrementalStream(jdbcTemplate, ship, stream);
             }
+        } catch (Exception e) {
+            if (metrics != null) {
+                for (IncrementalStream stream : TELEMETRY_STREAMS) {
+                    metrics.recordUploadBatch(stream.streamKey(), false);
+                }
+            }
+            log.warn("[Uploader] 轮询推送异常: shipId={}, mmsi={}, err={}",
+                    ship.shipId(), ship.mmsi(), e.getMessage());
         }
         if (backlogMetrics != null) {
             backlogMetrics.refresh();
@@ -151,7 +161,7 @@ public class DatabaseUploadPoller {
     }
 
     public void uploadIncrementalStream(JdbcTemplate jdbcTemplate,
-                                        ShipDataSourceManager.ShipDatabase ship,
+                                        LocalShip ship,
                                         IncrementalStream stream) {
         boolean batchRecorded = false;
         try {
@@ -248,16 +258,8 @@ public class DatabaseUploadPoller {
 
     /**
      * 带预注册的发送：先登记后发布，关闭“ACK 先于 track 到达即丢”的窗口。
-     *
-     * <ul>
-     *   <li>登记在 publish 之前：Application ACK 即使在 PUBACK 返回前到达也能命中，
-     *   不会被当成未知 ACK 丢弃；</li>
-     *   <li>成功后重锚时间戳（仅刷新在途登记，已裁剪/已 ACK 的不动，绝不复活）；</li>
-     *   <li>失败时仅当本轮新建才清理（回滚预注册）：补发路径的旧在途状态保留，
-     *   下轮继续等 ACK 或超时补发；游标两种情况都不动，更不产生假 ACK。</li>
-     * </ul>
      */
-    private boolean publishTracked(ShipDataSourceManager.ShipDatabase ship,
+    private boolean publishTracked(LocalShip ship,
                                    IncrementalStream stream, Map<String, Object> row,
                                    long rowId, String msgId) {
         String mmsi = ship.mmsi();
@@ -274,7 +276,7 @@ public class DatabaseUploadPoller {
     }
 
     /** 连续 ACK watermark 能推进才写游标；乱序缺口前停住等补发。 */
-    private void advanceWatermark(JdbcTemplate jdbcTemplate, ShipDataSourceManager.ShipDatabase ship,
+    private void advanceWatermark(JdbcTemplate jdbcTemplate, LocalShip ship,
                                  IncrementalStream stream, long lastId) {
         long watermark = ackTracker.watermark(ship.mmsi(), stream.tableName(), lastId);
         if (watermark > lastId) {
@@ -288,7 +290,7 @@ public class DatabaseUploadPoller {
      * 超时未 ACK 的补发（限本轮 batchSize 条）：按 id 回查原行重发，msg_id 由业务键
      * 确定故与之前完全相同，岸端去重吸收。行已不在（被清理）则放弃跟踪。
      */
-    private void resendTimedOut(JdbcTemplate jdbcTemplate, ShipDataSourceManager.ShipDatabase ship,
+    private void resendTimedOut(JdbcTemplate jdbcTemplate, LocalShip ship,
                                 IncrementalStream stream, int limit) {
         List<UploadAckTracker.Tracked> due = ackTracker.resendDue(
                 ship.mmsi(), stream.tableName(),
@@ -304,13 +306,13 @@ public class DatabaseUploadPoller {
                 continue;
             }
             prepareRow(ship, row);
-            // 补发同样先登记后发布（条目已在途，失败时保留旧状态等下轮）。
             boolean ok = publishTracked(ship, stream, row, t.rowId(), t.msgId());
             if (ok) {
                 if (metrics != null) {
                     metrics.recordUploadRows(stream.streamKey(), true, 1);
                 }
-            } else {                if (metrics != null) {
+            } else {
+                if (metrics != null) {
                     metrics.recordUploadRows(stream.streamKey(), false, 1);
                 }
                 log.warn("[Uploader] 补发失败，短路等待下轮: table={}, failId={}",
@@ -328,10 +330,10 @@ public class DatabaseUploadPoller {
         return rows.isEmpty() ? null : rows.get(0);
     }
 
-    private void prepareRow(ShipDataSourceManager.ShipDatabase ship, Map<String, Object> row) {
+    private void prepareRow(LocalShip ship, Map<String, Object> row) {
         row.putIfAbsent("ship_id", ship.shipId());
         row.putIfAbsent("mmsi", ship.mmsi());
-        row.putIfAbsent("source_database", ship.databaseName());
+        row.putIfAbsent("source_database", "local");
     }
 
     private void ensureCursorTable(JdbcTemplate jdbcTemplate) {

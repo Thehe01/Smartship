@@ -8,7 +8,7 @@ import org.springframework.jdbc.datasource.DriverManagerDataSource;
  * <p>
  * 说明：生产 {@code ship-schema.sql} 含 MySQL 方言（ENGINE / COMMENT / ON UPDATE），
  * H2 无法逐字执行；此处按生产持久化 SQL 实际使用的列子集建最小等价表，
- * 覆盖 {@code saveGps / saveWind / saveDepth / saveRudder / saveEngine} 与游标/注册表。
+ * 覆盖 {@code saveGps / saveWind / saveDepth / saveRudder / saveEngine} 与上传游标。
  */
 public final class BenchmarkFixtures {
 
@@ -72,27 +72,6 @@ public final class BenchmarkFixtures {
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (stream_name, partition_key)
                 )""");
-    }
-
-    public static void createRegistryTable(JdbcTemplate jt) {
-        jt.execute("""
-                CREATE TABLE IF NOT EXISTS ship_database_registry (
-                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    ship_id VARCHAR(64), mmsi VARCHAR(32) NOT NULL UNIQUE,
-                    database_name VARCHAR(64) NOT NULL,
-                    host VARCHAR(255) DEFAULT 'localhost', port INT DEFAULT 3306,
-                    username VARCHAR(64) DEFAULT 'root', password VARCHAR(128) DEFAULT '123456',
-                    enabled TINYINT(1) DEFAULT 1
-                )""");
-    }
-
-    public static void insertRegistryRow(JdbcTemplate jt, String shipId, String mmsi,
-                                         String dbName, String host, boolean enabled) {
-        jt.update("""
-                INSERT INTO ship_database_registry
-                    (ship_id, mmsi, database_name, host, port, username, password, enabled)
-                VALUES (?, ?, ?, ?, 0, 'sa', '', ?)
-                """, shipId, mmsi, dbName, host, enabled ? 1 : 0);
     }
 
     public static long count(JdbcTemplate jt, String table) {

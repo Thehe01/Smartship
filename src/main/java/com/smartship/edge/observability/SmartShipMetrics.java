@@ -73,6 +73,16 @@ public class SmartShipMetrics {
         }
     }
 
+    /**
+     * 本地兜底计数：单行写入重试耗尽后转存 {@code zncb_failed_writes} 时累加。
+     * 标签只有受控枚举 {@code type}，无 MMSI 高基数风险。
+     */
+    public void recordPersistenceFallback(String type) {
+        String cleanType = normalizeType(type);
+        getOrCreateCounter("smartship_persistence_fallback_total", "type", cleanType)
+                .increment();
+    }
+
     // ================= MQTT 指标 =================
 
     public void recordMqttConnect(boolean success) {

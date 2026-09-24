@@ -11,7 +11,6 @@ import com.smartship.edge.collector.model.BaseInfoVO;
 import com.smartship.edge.collector.model.ConfigDevice;
 import com.smartship.edge.config.EdgeProperties;
 import com.smartship.edge.routing.PersistenceThrottle;
-import com.smartship.edge.routing.ShipDataSourceManager;
 import com.smartship.edge.routing.service.NmeaDataPersistenceService;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.DisplayName;
@@ -85,10 +84,8 @@ class ModbusPipelineBenchmarkTest {
             properties.getCollect().getPersist().setEnabled(true);
             properties.getCollect().getPersist().setMinWriteIntervalSeconds(0);
 
-            ShipDataSourceManager manager = mock(ShipDataSourceManager.class);
-            when(manager.getJdbcTemplate(any(), eq(MMSI))).thenReturn(jt);
             NmeaDataPersistenceService realPersist =
-                    new NmeaDataPersistenceService(manager, properties, new PersistenceThrottle(properties));
+                    new NmeaDataPersistenceService(jt, properties, new PersistenceThrottle(properties));
             persistSpy = spy(realPersist);
             ModbusDataHandler handler = new ModbusDataHandler(
                     persistSpy, properties, new PersistenceThrottle(properties));
