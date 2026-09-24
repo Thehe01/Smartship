@@ -2,6 +2,7 @@ package com.smartship.edge.routing.service;
 
 import com.smartship.edge.config.EdgeProperties;
 import com.smartship.edge.observability.SmartShipMetrics;
+import com.smartship.edge.persist.FileFallbackStore;
 import com.smartship.edge.routing.PersistenceThrottle;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -27,16 +28,26 @@ public class NmeaDataPersistenceService {
     private final EdgeProperties properties;
     private final PersistenceThrottle throttle;
     private final SmartShipMetrics metrics;
+    private final FileFallbackStore fallbackStore;
 
     @Autowired
     public NmeaDataPersistenceService(JdbcTemplate jdbcTemplate,
                                       EdgeProperties properties,
                                       PersistenceThrottle throttle,
-                                      SmartShipMetrics metrics) {
+                                      SmartShipMetrics metrics,
+                                      FileFallbackStore fallbackStore) {
         this.jdbcTemplate = jdbcTemplate;
         this.properties = properties;
         this.throttle = throttle;
         this.metrics = metrics;
+        this.fallbackStore = fallbackStore;
+    }
+
+    public NmeaDataPersistenceService(JdbcTemplate jdbcTemplate,
+                                      EdgeProperties properties,
+                                      PersistenceThrottle throttle,
+                                      SmartShipMetrics metrics) {
+        this(jdbcTemplate, properties, throttle, metrics, new FileFallbackStore(properties));
     }
 
     public NmeaDataPersistenceService(JdbcTemplate jdbcTemplate,
@@ -117,6 +128,7 @@ public class NmeaDataPersistenceService {
     }
 
     private void writeFallback(String stream, String mmsi, Object[] args, String error) {
+        // tier 1：同库兜底表（可查询、可审计）
         try {
             String payload = truncate(java.util.Arrays.deepToString(args), 2000);
             String err = truncate(error, 500);
@@ -124,8 +136,25 @@ public class NmeaDataPersistenceService {
             if (metrics != null) {
                 metrics.recordPersistenceFallback(stream);
             }
+            return;
         } catch (Exception e) {
-            log.warn("[Persist-{}] 兜底表写入亦失败（本轮数据丢失，靠指标告警）: {}",
+            log.warn("[Persist-{}] 兜底表亦不可写（MySQL 可能整体故障），转磁盘 spool: {}",
+                    stream, e.getMessage());
+        }
+        // tier 2：磁盘 spool（MySQL 全挂也丢不了，回放器稍后重放）
+        try {
+            long dropped = fallbackStore.spool(stream, mmsi, args);
+            if (metrics != null) {
+                metrics.recordPersistenceFallback(stream);
+                if (dropped > 0) {
+                    metrics.recordFallbackDropped(dropped);
+                }
+            }
+        } catch (Exception e) {
+            if (metrics != null) {
+                metrics.recordFallbackDropped(1);
+            }
+            log.warn("[Persist-{}] 磁盘 spool 亦失败（本轮数据丢失，靠指标告警）: {}",
                     stream, e.getMessage());
         }
     }
@@ -135,6 +164,23 @@ public class NmeaDataPersistenceService {
             return "";
         }
         return s.length() <= max ? s : s.substring(0, max);
+    }
+
+    /**
+     * 流标识 → 主表 INSERT SQL（供磁盘 spool 回放器使用）。未知流返回 null。
+     */
+    public static String sqlForStream(String stream) {
+        if (stream == null) {
+            return null;
+        }
+        return switch (stream) {
+            case "gps" -> GPS_SQL;
+            case "wind" -> WIND_SQL;
+            case "depth" -> DEPTH_SQL;
+            case "rudder" -> RUDDER_SQL;
+            case "engine", "engine-batch" -> ENGINE_SQL;
+            default -> null;
+        };
     }
 
     @Async("persistenceExecutor")

@@ -146,6 +146,10 @@
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>
                     <mainClass>com.smartship.edge.EdgeCoreApplication</mainClass>
+                    <!-- 跨仓 E2E 需要：主产物保持普通 library jar（岸仓测试域可直接依赖
+                         真实 Edge 类），可运行包改名 -exec。部署/运行请改用
+                         target/smartship-edge-core-1.0.0-exec.jar -->
+                    <classifier>exec</classifier>
                 </configuration>
             </plugin>
         </plugins>

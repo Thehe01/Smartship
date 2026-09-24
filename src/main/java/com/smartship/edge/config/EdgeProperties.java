@@ -30,6 +30,16 @@ public class EdgeProperties {
         private boolean engineBatchEnabled = false;
         /** 满批行数（按船分组计数），默认 500。 */
         private int engineBatchSize = 500;
+        /** 本地兜底 spool 目录：主表+兜底表都写不进（MySQL 整体故障）时转存磁盘 JSONL。 */
+        private String fallbackDir = "data/failed-writes";
+        /** spool 磁盘上限（MB）：超限删最老文件并计数，绝不撑爆工控机闪存。 */
+        private int fallbackMaxMb = 100;
+        /** 兜底回放总开关。 */
+        private boolean replayEnabled = true;
+        /** 回放周期（毫秒）：启动后按此间隔把 spool 重写入主表。 */
+        private long replayIntervalMs = 30000L;
+        /** 单轮回放上限（行）：避免长停机后积压一次性打爆 DB。 */
+        private int replayBatchSize = 200;
         private PoolConfig pool = new PoolConfig();
     }
 

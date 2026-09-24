@@ -83,6 +83,22 @@ public class SmartShipMetrics {
                 .increment();
     }
 
+    /** 兜底回放计数：spool 行重写入主表成功/失败。 */
+    public void recordFallbackReplay(boolean success) {
+        getOrCreateCounter("smartship_persistence_replay_total",
+                "result", success ? "success" : "failure")
+                .increment();
+    }
+
+    /** 兜底丢失计数：spool 磁盘超限删除 / 坏行跳过 / 未知流丢弃。 */
+    public void recordFallbackDropped(long count) {
+        if (count <= 0) {
+            return;
+        }
+        getOrCreateCounter("smartship_persistence_fallback_dropped_total")
+                .increment(count);
+    }
+
     // ================= MQTT 指标 =================
 
     public void recordMqttConnect(boolean success) {

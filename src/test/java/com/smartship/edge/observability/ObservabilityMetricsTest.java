@@ -33,6 +33,9 @@ public class ObservabilityMetricsTest {
     private SimpleMeterRegistry registry;
     private SmartShipMetrics smartShipMetrics;
 
+    @org.junit.jupiter.api.io.TempDir
+    private java.nio.file.Path tempDir;
+
     @BeforeEach
     void setUp() {
         registry = new SimpleMeterRegistry();
@@ -130,6 +133,8 @@ public class ObservabilityMetricsTest {
         EdgeProperties properties = new EdgeProperties();
         properties.setSchemaReady(true);
         properties.getCollect().getPersist().setEnabled(true);
+        properties.getCollect().getPersist()
+                .setFallbackDir(tempDir.resolve("fallback").toString());
 
         NmeaDataPersistenceService service = new NmeaDataPersistenceService(
                 jt, properties, null, smartShipMetrics);
