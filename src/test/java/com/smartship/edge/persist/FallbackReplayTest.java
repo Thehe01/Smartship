@@ -193,4 +193,69 @@ class FallbackReplayTest {
         assertEquals(0L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class),
                 "毒行永不污染主表");
     }
+
+    @Test
+    @DisplayName("P2：毒行占满首屏也不饿死后面的正常行（游标分页）")
+    void poisonRowsNeverStarveLaterRows() {
+        JdbcTemplate jt = dbWithFallbackTable();
+        for (int i = 0; i < 3; i++) {
+            jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, payload, error) VALUES (?,?,?,?)",
+                    "gps", "413999999", "poison-" + i, "legacy");
+        }
+
+        EdgeProperties properties = new EdgeProperties();
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        FallbackReplayer replayer = new FallbackReplayer(jt, properties, new FileFallbackStore(tempDir, 1024L, 4096L), new SmartShipMetrics(registry));
+        // 先把毒行记次刷满（模拟长期滞留）
+        for (int i = 0; i < FallbackReplayer.MAX_ROW_ATTEMPTS + 1; i++) {
+            replayer.replayDbTable(10);
+        }
+
+        // 正常行 id 更大、排在毒行后面，预算仅 2（首屏装不下正常行）
+        Object[] args = {"S001", "413999999", "RMC", "SERIAL",
+                java.time.LocalDateTime.of(2026, 9, 19, 10, 0, 0),
+                31.2, 121.5, 12.0, 180.0, 180.0, 180.0, 0.0, 10.0, 8, 1.0, 1, "A"};
+        jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, payload, error) VALUES (?,?,?,?)",
+                "gps", "413999999",
+                com.smartship.edge.persist.FileFallbackStore.argsToJson("gps", "413999999", args),
+                "boom");
+        replayer.replayDbTable(2);
+
+        assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class),
+                "游标分页必须越过超限毒行回放正常行");
+        assertEquals(3L, jt.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class),
+                "毒行保留供人工审计");
+    }
+
+    @Test
+    @DisplayName("文件逐行落盘进度：两行成功触发两次回写")
+    void fileProgressPersistedPerRow() throws Exception {
+        JdbcTemplate jt = realDb();
+        com.smartship.edge.persist.FileFallbackStore store =
+                org.mockito.Mockito.mock(com.smartship.edge.persist.FileFallbackStore.class);
+        Object[] args = {"S001", "413999999", "RMC", "SERIAL",
+                java.time.LocalDateTime.of(2026, 9, 19, 10, 0, 0),
+                31.2, 121.5, 12.0, 180.0, 180.0, 180.0, 0.0, 10.0, 8, 1.0, 1, "A"};
+        com.smartship.edge.persist.FileFallbackStore.ParsedLine parsed =
+                com.smartship.edge.persist.FileFallbackStore.parseLine(
+                        com.smartship.edge.persist.FileFallbackStore.argsToJson("gps", "413999999", args));
+        com.smartship.edge.persist.FileFallbackStore.ReplayRecord rec =
+                new com.smartship.edge.persist.FileFallbackStore.ReplayRecord(
+                        "gps", "413999999", parsed.args(), "line-stub");
+        com.smartship.edge.persist.FileFallbackStore.PendingFile file =
+                new com.smartship.edge.persist.FileFallbackStore.PendingFile(
+                        tempDir.resolve("stub.jsonl"));
+        org.mockito.Mockito.when(store.readAll(file)).thenReturn(
+                new com.smartship.edge.persist.FileFallbackStore.ReadResult(
+                        java.util.List.of(rec, rec), 0));
+
+        EdgeProperties properties = new EdgeProperties();
+        FallbackReplayer replayer = new FallbackReplayer(jt, properties, store,
+                new SmartShipMetrics(new SimpleMeterRegistry()));
+        replayer.replayFile(file, 10);
+
+        assertEquals(2L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class));
+        org.mockito.Mockito.verify(store, org.mockito.Mockito.times(2))
+                .rewrite(org.mockito.Mockito.eq(file), org.mockito.Mockito.anyList());
+    }
 }
