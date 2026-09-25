@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS zncb_gps_data (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     ship_id VARCHAR(64) NOT NULL COMMENT '船舶编号',
     mmsi VARCHAR(32) NOT NULL COMMENT 'MMSI',
+    replay_id VARCHAR(64) NULL DEFAULT NULL COMMENT '回放幂等键（兜底回放设置，UNIQUE吸收重复）',
     sentence_type VARCHAR(10),
     source VARCHAR(32) DEFAULT 'serial',
     timestamp DATETIME,
@@ -25,7 +26,8 @@ CREATE TABLE IF NOT EXISTS zncb_gps_data (
     gps_status VARCHAR(10) COMMENT '定位状态 A-有效 V-警告',
     create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_ship_ts (ship_id, timestamp),
-    INDEX idx_mmsi (mmsi)
+    INDEX idx_mmsi (mmsi),
+    UNIQUE KEY uk_gps_replay_id (replay_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='GPS 综合导航数据表';
 
 -- 2. 风速风向表
@@ -33,6 +35,7 @@ CREATE TABLE IF NOT EXISTS zncb_wind_data (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     ship_id VARCHAR(64) NOT NULL,
     mmsi VARCHAR(32) NOT NULL,
+    replay_id VARCHAR(64) NULL DEFAULT NULL COMMENT '回放幂等键（兜底回放设置，UNIQUE吸收重复）',
     sentence_type VARCHAR(10),
     source VARCHAR(32) DEFAULT 'serial',
     timestamp DATETIME,
@@ -42,7 +45,8 @@ CREATE TABLE IF NOT EXISTS zncb_wind_data (
     true_wind_direction DECIMAL(8,3) COMMENT '真风向',
     true_wind_speed DECIMAL(8,3) COMMENT '真风速',
     create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_ship_ts (ship_id, timestamp)
+    INDEX idx_ship_ts (ship_id, timestamp),
+    UNIQUE KEY uk_wind_replay_id (replay_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='风速风向数据表';
 
 -- 3. 水深测深表
@@ -50,13 +54,15 @@ CREATE TABLE IF NOT EXISTS zncb_depth_data (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     ship_id VARCHAR(64) NOT NULL,
     mmsi VARCHAR(32) NOT NULL,
+    replay_id VARCHAR(64) NULL DEFAULT NULL COMMENT '回放幂等键（兜底回放设置，UNIQUE吸收重复）',
     sentence_type VARCHAR(10),
     source VARCHAR(32) DEFAULT 'serial',
     timestamp DATETIME,
     depth_m DECIMAL(8,2) COMMENT '水深 (米)',
     transducer_offset_m DECIMAL(8,2) COMMENT '换能器吃水偏移',
     create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_ship_ts (ship_id, timestamp)
+    INDEX idx_ship_ts (ship_id, timestamp),
+    UNIQUE KEY uk_depth_replay_id (replay_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='水深测深数据表';
 
 -- 4. 舵角表
@@ -64,12 +70,14 @@ CREATE TABLE IF NOT EXISTS zncb_rudder_data (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     ship_id VARCHAR(64) NOT NULL,
     mmsi VARCHAR(32) NOT NULL,
+    replay_id VARCHAR(64) NULL DEFAULT NULL COMMENT '回放幂等键（兜底回放设置，UNIQUE吸收重复）',
     sentence_type VARCHAR(10),
     source VARCHAR(32) DEFAULT 'serial',
     timestamp DATETIME,
     rudder_angle DECIMAL(8,3) COMMENT '舵角 (度)',
     create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_ship_ts (ship_id, timestamp)
+    INDEX idx_ship_ts (ship_id, timestamp),
+    UNIQUE KEY uk_rudder_replay_id (replay_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='舵角传感器数据表';
 
 -- 5. 主机/动力机舱 Modbus 运行参数表
@@ -77,6 +85,7 @@ CREATE TABLE IF NOT EXISTS zncb_engine_data (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     ship_id VARCHAR(64) NOT NULL,
     mmsi VARCHAR(32) NOT NULL,
+    replay_id VARCHAR(64) NULL DEFAULT NULL COMMENT '回放幂等键（兜底回放设置，UNIQUE吸收重复）',
     slave_id INT COMMENT '从站 ID',
     device_id VARCHAR(50),
     protocol VARCHAR(20) DEFAULT 'MODBUS_TCP',
@@ -96,7 +105,8 @@ CREATE TABLE IF NOT EXISTS zncb_engine_data (
     alarm_bits2 INT COMMENT '故障标志位2',
     create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_ship_ts (ship_id, timestamp),
-    INDEX idx_slave (slave_id)
+    INDEX idx_slave (slave_id),
+    UNIQUE KEY uk_engine_replay_id (replay_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='主机 Modbus 遥测数据表';
 
 -- 6. [模块四] 本地上传游标断点记录表

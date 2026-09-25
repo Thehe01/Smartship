@@ -78,8 +78,9 @@ public class FileFallbackStore {
     public record PendingFile(Path path) {
     }
 
-    /** 一条可回放记录。 */
-    public record ReplayRecord(String stream, String mmsi, List<TypedArg> args, String rawLine) {
+    /** 一条可回放记录（replayId 恒定：崩溃重试复用同一幂等键）。 */
+    public record ReplayRecord(
+            String stream, String mmsi, String replayId, List<TypedArg> args, String rawLine) {
     }
 
     /** 带类型标签的 JDBC 参数。 */
@@ -117,11 +118,17 @@ public class FileFallbackStore {
 
     /** 单行记录编码（文件 spool 与 DB 兜底表共用同一格式，保证两处都可回放）。 */
     public static String argsToJson(String stream, String mmsi, Object[] args) {
+        return argsToJson(stream, mmsi, java.util.UUID.randomUUID().toString(), args);
+    }
+
+    /** 同上，replay_id 由调用方指定（测试 pin 住确定性时使用）。 */
+    public static String argsToJson(String stream, String mmsi, String replayId, Object[] args) {
         ObjectNode root = MAPPER.createObjectNode();
         root.put("v", 1);
         root.put("ts", LocalDateTime.now().toString());
         root.put("stream", stream);
         root.put("mmsi", mmsi == null ? "" : mmsi);
+        root.put("replay_id", replayId == null ? "" : replayId);
         ArrayNode arr = root.putArray("args");
         if (args != null) {
             for (Object a : args) {
@@ -150,10 +157,16 @@ public class FileFallbackStore {
         return new ParsedLine(
                 root.path("stream").asText(""),
                 root.path("mmsi").asText(""),
+                normalizeReplayId(root.path("replay_id").asText(null)),
                 List.copyOf(args));
     }
 
-    public record ParsedLine(String stream, String mmsi, List<TypedArg> args) {
+    public record ParsedLine(String stream, String mmsi, String replayId, List<TypedArg> args) {
+    }
+
+    /** 空 replay_id 视为缺失（老版本 spool 行）：回放用 NULL，不与他人冲突。 */
+    private static String normalizeReplayId(String raw) {
+        return raw == null || raw.isBlank() ? null : raw;
     }
 
     /** 最老优先列出待回放文件（含当前 active 文件）。 */
@@ -207,7 +220,7 @@ public class FileFallbackStore {
             try {
                 ParsedLine parsed = parseLine(line);
                 records.add(new ReplayRecord(
-                        parsed.stream(), parsed.mmsi(), parsed.args(), line));
+                        parsed.stream(), parsed.mmsi(), parsed.replayId(), parsed.args(), line));
             } catch (Exception e) {
                 badLines++;
                 log.warn("[Fallback] spool 坏行跳过: {}", e.getMessage());

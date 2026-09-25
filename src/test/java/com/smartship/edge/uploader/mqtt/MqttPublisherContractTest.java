@@ -1,6 +1,7 @@
 package com.smartship.edge.uploader.mqtt;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -50,8 +51,7 @@ class MqttPublisherContractTest {
 
     @Test
     @DisplayName("契约v1：发布载荷携带 mmsi/type/msg_id/sent_at 且 topic 精确")
-    void publishedPayloadCarriesContractKeys() throws Exception {
-        MqttClientManager manager = mock(MqttClientManager.class);
+    void publishedPayloadCarriesContractKeys() throws Exception {        MqttClientManager manager = mock(MqttClientManager.class);
         when(manager.publish(anyString(), any())).thenReturn(true);
         MqttPublisher publisher = new MqttPublisher(manager);
 
@@ -69,5 +69,28 @@ class MqttPublisherContractTest {
         assertEquals("nmea_gps", payload.get("type"));
         assertEquals(FROZEN_MSG_ID_V1, payload.get("msg_id"));
         assertTrue(payload.containsKey("sent_at"), "载荷必须携带 sent_at");
+    }
+
+    @Test
+    @DisplayName("契约v1+replay_id：同 replay_id 不同自增 id → 同 msg_id（回放幂等基石）")
+    void replayIdPreferredOverAutoId() {
+        Map<String, Object> row1 = new LinkedHashMap<>();
+        row1.put("replay_id", "replay-uuid-1");
+        row1.put("id", 100L);
+        row1.put("update_time", "2026-09-19T10:00:00");
+        Map<String, Object> row2 = new LinkedHashMap<>();
+        row2.put("replay_id", "replay-uuid-1");
+        row2.put("id", 101L);
+        row2.put("update_time", "2026-09-19T10:00:00");
+
+        assertEquals(MqttPublisher.stableMessageId("413999999", "nmea_gps", row1),
+                MqttPublisher.stableMessageId("413999999", "nmea_gps", row2),
+                "回放行自增 id 不同但 replay_id 相同，msg_id 必须相同，岸端 UNIQUE 去重");
+
+        Map<String, Object> row3 = new LinkedHashMap<>(row2);
+        row3.remove("replay_id");
+        assertNotEquals(MqttPublisher.stableMessageId("413999999", "nmea_gps", row1),
+                MqttPublisher.stableMessageId("413999999", "nmea_gps", row3),
+                "无 replay_id 的行走旧语义（回放行与正常行互不干扰）");
     }
 }

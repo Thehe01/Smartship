@@ -77,10 +77,13 @@ public class MqttPublisher {
     }
 
     /**
-     * 计算确定性稳定 Message ID（SHA-256 散列）
+     * 计算确定性稳定 Message ID（SHA-256 散列）。
+     * <p>身份键优先 {@code replay_id}：兜底回放行复用原 replay_id（自增 id 会变），
+     * 同一业务内容在任何路径下 msg_id 恒定，岸端 {@code UNIQUE(msg_id)} 可去重。
+     * 无 replay_id 的行退化为旧语义（自然主键/时间戳 → id），契约 v1 冻结向量不受影响。
      */
     public static String stableMessageId(String mmsi, String type, Map<String, Object> row) {
-        String sourceIdentity = first(row, "source_id", "external_alarm_id", "local_id", "id", "device_code");
+        String sourceIdentity = first(row, "replay_id", "source_id", "external_alarm_id", "local_id", "id", "device_code");
         String sourceTime = first(row, "update_time", "updated_at", "rec_time", "alarm_time", "time", "timestamp", "create_time");
         
         String canonical;

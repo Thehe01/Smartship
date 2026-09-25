@@ -183,6 +183,35 @@ public class NmeaDataPersistenceService {
         };
     }
 
+    /**
+     * 流标识 → 回放 INSERT SQL：在基础 SQL 上追加 {@code replay_id} 列与占位。
+     * <p>重复吸收不靠方言 {@code ON DUPLICATE KEY UPDATE}（H2 测不了、MySQL 才有），
+     * 而靠调用方捕获 {@code DuplicateKeyException} 视为成功：唯一约束保证同一
+     * replay_id 只有一条物理行，重放即幂等。Spring 在 MySQL/H2 下都把唯一冲突翻译
+     * 为该异常，单条代码路径两边可测。
+     * <p>由基础 SQL 派生而非手写第二套列清单：列清单只维护一份，派生逻辑由单测 pin 住。
+     */
+    public static String replaySqlForStream(String stream) {
+        String base = sqlForStream(stream);
+        if (base == null) {
+            return null;
+        }
+        // 注意：text block 会剥离缩进，VALUES 行首是换行符而非空格。
+        int v = base.lastIndexOf("VALUES ");
+        if (v < 0) {
+            throw new IllegalStateException("unexpected INSERT shape for stream=" + stream);
+        }
+        String head = base.substring(0, v);
+        String tail = base.substring(v);
+        int colsEnd = head.lastIndexOf(')');
+        int holdersEnd = tail.lastIndexOf(')');
+        if (colsEnd < 0 || holdersEnd < 0) {
+            throw new IllegalStateException("unexpected INSERT shape for stream=" + stream);
+        }
+        return head.substring(0, colsEnd) + ", replay_id)"
+                + tail.substring(0, holdersEnd) + ", ?)";
+    }
+
     @Async("persistenceExecutor")
     public void saveGps(String sentenceType, String source,
                         Double lat, Double lon, Double speedKnots, Double course,

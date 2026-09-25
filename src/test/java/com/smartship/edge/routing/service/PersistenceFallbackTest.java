@@ -2,6 +2,8 @@ package com.smartship.edge.routing.service;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
@@ -184,5 +186,34 @@ class PersistenceFallbackTest {
         assertEquals(0, service.saveEngineBatch(batch));
         assertEquals(1.0, counter("smartship_persistence_fallback_total",
                 "type", "engine").count(), "补写耗尽的行必须进兜底");
+    }
+
+    @Test
+    @DisplayName("replaySql派生：5流全覆盖，列+占位完整（重复由唯一约束+异常吸收）")
+    void replaySqlDerivedForAllStreams() {
+        for (String stream : new String[]{"gps", "wind", "depth", "rudder", "engine"}) {
+            String base = NmeaDataPersistenceService.sqlForStream(stream);
+            String replay = NmeaDataPersistenceService.replaySqlForStream(stream);
+            assertNotNull(replay, stream);
+            assertTrue(replay.contains(", replay_id)"),
+                    stream + " 必须追加 replay_id 列");
+            assertEquals(countChar(base, '?') + 1, countChar(replay, '?'),
+                    stream + " 占位符必须恰好多一个");
+            assertTrue(replay.contains("INSERT INTO zncb_" + stream),
+                    stream + " 表名必须与基础 SQL 同源");
+            assertTrue(replay.trim().endsWith(", ?)"),
+                    stream + " 占位符清单必须以 replay_id 收尾");
+        }
+        assertNull(NmeaDataPersistenceService.replaySqlForStream("nope"));
+    }
+
+    private static int countChar(String s, char c) {
+        int n = 0;
+        for (int i = 0; i < s.length(); i++) {
+            if (s.charAt(i) == c) {
+                n++;
+            }
+        }
+        return n;
     }
 }

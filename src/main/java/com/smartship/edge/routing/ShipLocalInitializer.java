@@ -43,6 +43,7 @@ public class ShipLocalInitializer {
         }
         try {
             executeShipSchema(jdbcTemplate);
+            ensureReplayIdColumns(jdbcTemplate);
             properties.setSchemaReady(true);
             preparedMmsi = mmsi;
             MmsiPersistence.write(mmsi);
@@ -71,6 +72,41 @@ public class ShipLocalInitializer {
             log.debug("[LocalInit] 本船库时序表结构检查/自建完成");
         } catch (Exception e) {
             throw new IllegalStateException("时序表结构初始化异常: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 存量库迁移：给 5 张时序表补 {@code replay_id} 列与唯一约束（新库建表已自带）。
+     * <p>{@code CREATE TABLE IF NOT EXISTS} 不会给老表加列，不迁则回放 SQL 因缺列
+     * 失败。本方法 best-effort：重复执行安全（重复信号直接忽略），真实异常只告警
+     * 不阻止启动（最坏情况是回放不可用，正常写入不受影响）。
+     */
+    static void ensureReplayIdColumns(JdbcTemplate jt) {
+        for (String table : java.util.List.of(
+                "zncb_gps_data", "zncb_wind_data", "zncb_depth_data",
+                "zncb_rudder_data", "zncb_engine_data")) {
+            execIfAbsent(jt, table,
+                    "ALTER TABLE " + table
+                            + " ADD COLUMN replay_id VARCHAR(64) NULL DEFAULT NULL");
+            execIfAbsent(jt, table,
+                    "ALTER TABLE " + table
+                            + " ADD CONSTRAINT uk_" + table + "_replay_id UNIQUE (replay_id)");
+        }
+    }
+
+    private static void execIfAbsent(JdbcTemplate jt, String table, String ddl) {
+        try {
+            jt.execute(ddl);
+            log.info("[LocalInit] 存量表 {} 迁移成功: {}", table,
+                    ddl.substring(0, Math.min(80, ddl.length())));
+        } catch (Exception e) {
+            String msg = String.valueOf(e.getMessage());
+            if (msg.contains("Duplicate") || msg.contains("duplicate")
+                    || msg.contains("already exists") || msg.contains("already Exists")) {
+                log.debug("[LocalInit] 存量表 {} 已有该结构，跳过", table);
+                return;
+            }
+            log.warn("[LocalInit] 存量表 {} 迁移异常（回放可能不可用）: {}", table, e.getMessage());
         }
     }
 }

@@ -32,6 +32,12 @@ class ShipSchemaIsolationTest {
         assertTrue(shipSql.contains("CREATE TABLE IF NOT EXISTS zncb_upload_cursor"), "必须包含本地上传游标断点表");
         assertTrue(shipSql.contains("CREATE TABLE IF NOT EXISTS zncb_failed_writes"), "必须包含本地写入兜底表");
 
+        // 回放幂等列：5 张时序表必须全部携带 replay_id + 唯一约束
+        for (String table : new String[]{"gps", "wind", "depth", "rudder", "engine"}) {
+            assertTrue(shipSql.contains("UNIQUE KEY uk_" + table + "_replay_id (replay_id)"),
+                    table + " 表必须有 replay_id 唯一约束");
+        }
+
         // 分船注册表文件必须已删除（单船模式无主认证库）
         ClassPathResource authSchemaRes = new ClassPathResource("schema/auth-schema.sql");
         assertFalse(authSchemaRes.exists(), "单船模式下 schema/auth-schema.sql 必须已删除");

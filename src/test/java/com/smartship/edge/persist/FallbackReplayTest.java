@@ -36,7 +36,9 @@ class FallbackReplayTest {
                 latitude DOUBLE, longitude DOUBLE, speed_knots DOUBLE,
                 course_over_ground DOUBLE, heading_true DOUBLE, heading_magnetic DOUBLE,
                 magnetic_variation DOUBLE, altitude_m DOUBLE, satellites INT,
-                hdop DOUBLE, position_quality INT, gps_status VARCHAR(16)
+                hdop DOUBLE, position_quality INT, gps_status VARCHAR(16),
+                replay_id VARCHAR(64) NULL,
+                CONSTRAINT uk_gps_replay_id UNIQUE (replay_id)
             )""";
 
     private JdbcTemplate realDb() {
@@ -229,8 +231,7 @@ class FallbackReplayTest {
 
     @Test
     @DisplayName("文件逐行落盘进度：两行成功触发两次回写")
-    void fileProgressPersistedPerRow() throws Exception {
-        JdbcTemplate jt = realDb();
+    void fileProgressPersistedPerRow() throws Exception {        JdbcTemplate jt = realDb();
         com.smartship.edge.persist.FileFallbackStore store =
                 org.mockito.Mockito.mock(com.smartship.edge.persist.FileFallbackStore.class);
         Object[] args = {"S001", "413999999", "RMC", "SERIAL",
@@ -239,15 +240,21 @@ class FallbackReplayTest {
         com.smartship.edge.persist.FileFallbackStore.ParsedLine parsed =
                 com.smartship.edge.persist.FileFallbackStore.parseLine(
                         com.smartship.edge.persist.FileFallbackStore.argsToJson("gps", "413999999", args));
+        com.smartship.edge.persist.FileFallbackStore.ParsedLine parsed2 =
+                com.smartship.edge.persist.FileFallbackStore.parseLine(
+                        com.smartship.edge.persist.FileFallbackStore.argsToJson("gps", "413999999", args));
         com.smartship.edge.persist.FileFallbackStore.ReplayRecord rec =
                 new com.smartship.edge.persist.FileFallbackStore.ReplayRecord(
-                        "gps", "413999999", parsed.args(), "line-stub");
+                        "gps", "413999999", parsed.replayId(), parsed.args(), "line-stub");
+        com.smartship.edge.persist.FileFallbackStore.ReplayRecord rec2 =
+                new com.smartship.edge.persist.FileFallbackStore.ReplayRecord(
+                        "gps", "413999999", parsed2.replayId(), parsed2.args(), "line-stub-2");
         com.smartship.edge.persist.FileFallbackStore.PendingFile file =
                 new com.smartship.edge.persist.FileFallbackStore.PendingFile(
                         tempDir.resolve("stub.jsonl"));
         org.mockito.Mockito.when(store.readAll(file)).thenReturn(
                 new com.smartship.edge.persist.FileFallbackStore.ReadResult(
-                        java.util.List.of(rec, rec), 0));
+                        java.util.List.of(rec, rec2), 0));
 
         EdgeProperties properties = new EdgeProperties();
         FallbackReplayer replayer = new FallbackReplayer(jt, properties, store,
@@ -257,5 +264,69 @@ class FallbackReplayTest {
         assertEquals(2L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class));
         org.mockito.Mockito.verify(store, org.mockito.Mockito.times(2))
                 .rewrite(org.mockito.Mockito.eq(file), org.mockito.Mockito.anyList());
+    }
+
+    @Test
+    @DisplayName("崩溃模拟：主表已写、兜底行未删，再次回放仍只有一条")
+    void crashBetweenInsertAndDeleteStaysSingleRow() {
+        JdbcTemplate jt = dbWithFallbackTable();
+        Object[] args = {"S001", "413999999", "RMC", "SERIAL",
+                java.time.LocalDateTime.of(2026, 9, 19, 10, 0, 0),
+                31.2, 121.5, 12.0, 180.0, 180.0, 180.0, 0.0, 10.0, 8, 1.0, 1, "A"};
+        String payload = com.smartship.edge.persist.FileFallbackStore.argsToJson(
+                "gps", "413999999", "crash-sim-replay-id-1", args);
+        jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, payload, error) VALUES (?,?,?,?)",
+                "gps", "413999999", payload, "boom");
+
+        EdgeProperties properties = new EdgeProperties();
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        FallbackReplayer replayer = new FallbackReplayer(jt, properties, new FileFallbackStore(tempDir, 1024L, 4096L), new SmartShipMetrics(registry));
+        // 第一轮正常回放：主表 1 行，兜底删行
+        replayer.replay();
+        assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class));
+
+        // 还原崩溃现场：主表行已在，兜底行“没删掉”（同一 replay_id 再次出现）
+        jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, payload, error) VALUES (?,?,?,?)",
+                "gps", "413999999", payload, "boom");
+        replayer.replay();
+
+        assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class),
+                "唯一约束必须吸收重复回放，主表仍只有一条");
+        assertEquals(0L, jt.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class),
+                "吸收后兜底行照常删除");
+    }
+
+    @Test
+    @DisplayName("P2：前面5000毒行，后面正常行同轮仍被扫描到")
+    void fiveThousandPoisonRowsDoNotStarveGoodRow() {
+        JdbcTemplate jt = dbWithFallbackTable();
+        StringBuilder sb = new StringBuilder(
+                "INSERT INTO zncb_failed_writes (stream, mmsi, payload, error) VALUES ");
+        for (int i = 0; i < 5000; i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append("('gps','413999999','poison-").append(i).append("','legacy')");
+        }
+        jt.execute(sb.toString());
+
+        Object[] args = {"S001", "413999999", "RMC", "SERIAL",
+                java.time.LocalDateTime.of(2026, 9, 19, 10, 0, 0),
+                31.2, 121.5, 12.0, 180.0, 180.0, 180.0, 0.0, 10.0, 8, 1.0, 1, "A"};
+        jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, payload, error) VALUES (?,?,?,?)",
+                "gps", "413999999",
+                com.smartship.edge.persist.FileFallbackStore.argsToJson("gps", "413999999", args),
+                "boom");
+
+        EdgeProperties properties = new EdgeProperties();
+        FallbackReplayer replayer = new FallbackReplayer(jt, properties, new FileFallbackStore(tempDir, 1024L, 4096L),
+                new SmartShipMetrics(new SimpleMeterRegistry()));
+        // 单轮、默认预算：毒行不消耗 budget，游标翻页直达正常行
+        replayer.replayDbTable(200);
+
+        assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class),
+                "5000毒行之后正常行必须同轮回放");
+        assertEquals(5000L, jt.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class),
+                "毒行保留供人工审计");
     }
 }
