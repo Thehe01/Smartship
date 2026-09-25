@@ -99,7 +99,7 @@ class FallbackReplayTest {
     void failedReplayKeepsScene() throws Exception {
         FileFallbackStore store = new FileFallbackStore(tempDir, 10L * 1024L * 1024L,
                 100L * 1024L * 1024L);
-        store.spool("gps", "413999999", gpsArgs());
+        store.spool("gps", "413999999", "r-down-1", gpsArgs());
 
         JdbcTemplate deadJt = mock(JdbcTemplate.class);
         when(deadJt.update(anyString(), any(Object[].class)))
@@ -120,8 +120,10 @@ class FallbackReplayTest {
             CREATE TABLE zncb_failed_writes (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 stream VARCHAR(32), mmsi VARCHAR(32),
+                replay_id VARCHAR(64) NULL,
                 payload TEXT, error VARCHAR(500),
-                create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT uk_failed_replay_id UNIQUE (replay_id)
             )""";
 
     private JdbcTemplate dbWithFallbackTable() {
@@ -143,7 +145,7 @@ class FallbackReplayTest {
                 31.2, 121.5, 12.0, 180.0, 180.0, 180.0, 0.0, 10.0, 8, 1.0, 1, "A"};
         jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, payload, error) VALUES (?,?,?,?)",
                 "gps", "413999999",
-                com.smartship.edge.persist.FileFallbackStore.argsToJson("gps", "413999999", args),
+                com.smartship.edge.persist.FileFallbackStore.argsToJson("gps", "413999999", "r-json-1", args),
                 "boom");
 
         EdgeProperties properties = new EdgeProperties();
@@ -219,7 +221,7 @@ class FallbackReplayTest {
                 31.2, 121.5, 12.0, 180.0, 180.0, 180.0, 0.0, 10.0, 8, 1.0, 1, "A"};
         jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, payload, error) VALUES (?,?,?,?)",
                 "gps", "413999999",
-                com.smartship.edge.persist.FileFallbackStore.argsToJson("gps", "413999999", args),
+                com.smartship.edge.persist.FileFallbackStore.argsToJson("gps", "413999999", "r-json-1", args),
                 "boom");
         replayer.replayDbTable(2);
 
@@ -231,7 +233,8 @@ class FallbackReplayTest {
 
     @Test
     @DisplayName("文件逐行落盘进度：两行成功触发两次回写")
-    void fileProgressPersistedPerRow() throws Exception {        JdbcTemplate jt = realDb();
+    void fileProgressPersistedPerRow() throws Exception {
+        JdbcTemplate jt = realDb();
         com.smartship.edge.persist.FileFallbackStore store =
                 org.mockito.Mockito.mock(com.smartship.edge.persist.FileFallbackStore.class);
         Object[] args = {"S001", "413999999", "RMC", "SERIAL",
@@ -239,10 +242,10 @@ class FallbackReplayTest {
                 31.2, 121.5, 12.0, 180.0, 180.0, 180.0, 0.0, 10.0, 8, 1.0, 1, "A"};
         com.smartship.edge.persist.FileFallbackStore.ParsedLine parsed =
                 com.smartship.edge.persist.FileFallbackStore.parseLine(
-                        com.smartship.edge.persist.FileFallbackStore.argsToJson("gps", "413999999", args));
+                        com.smartship.edge.persist.FileFallbackStore.argsToJson("gps", "413999999", "r-json-1", args));
         com.smartship.edge.persist.FileFallbackStore.ParsedLine parsed2 =
                 com.smartship.edge.persist.FileFallbackStore.parseLine(
-                        com.smartship.edge.persist.FileFallbackStore.argsToJson("gps", "413999999", args));
+                        com.smartship.edge.persist.FileFallbackStore.argsToJson("gps", "413999999", "r-json-2", args));
         com.smartship.edge.persist.FileFallbackStore.ReplayRecord rec =
                 new com.smartship.edge.persist.FileFallbackStore.ReplayRecord(
                         "gps", "413999999", parsed.replayId(), parsed.args(), "line-stub");
@@ -275,8 +278,9 @@ class FallbackReplayTest {
                 31.2, 121.5, 12.0, 180.0, 180.0, 180.0, 0.0, 10.0, 8, 1.0, 1, "A"};
         String payload = com.smartship.edge.persist.FileFallbackStore.argsToJson(
                 "gps", "413999999", "crash-sim-replay-id-1", args);
-        jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, payload, error) VALUES (?,?,?,?)",
-                "gps", "413999999", payload, "boom");
+        jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, replay_id, payload, error)"
+                        + " VALUES (?,?,?,?,?)",
+                "gps", "413999999", "crash-sim-replay-id-1", payload, "boom");
 
         EdgeProperties properties = new EdgeProperties();
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
@@ -286,8 +290,9 @@ class FallbackReplayTest {
         assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class));
 
         // 还原崩溃现场：主表行已在，兜底行“没删掉”（同一 replay_id 再次出现）
-        jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, payload, error) VALUES (?,?,?,?)",
-                "gps", "413999999", payload, "boom");
+        jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, replay_id, payload, error)"
+                        + " VALUES (?,?,?,?,?)",
+                "gps", "413999999", "crash-sim-replay-id-1", payload, "boom");
         replayer.replay();
 
         assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class),
@@ -315,7 +320,7 @@ class FallbackReplayTest {
                 31.2, 121.5, 12.0, 180.0, 180.0, 180.0, 0.0, 10.0, 8, 1.0, 1, "A"};
         jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, payload, error) VALUES (?,?,?,?)",
                 "gps", "413999999",
-                com.smartship.edge.persist.FileFallbackStore.argsToJson("gps", "413999999", args),
+                com.smartship.edge.persist.FileFallbackStore.argsToJson("gps", "413999999", "r-json-1", args),
                 "boom");
 
         EdgeProperties properties = new EdgeProperties();
@@ -328,5 +333,36 @@ class FallbackReplayTest {
                 "5000毒行之后正常行必须同轮回放");
         assertEquals(5000L, jt.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class),
                 "毒行保留供人工审计");
+    }
+
+    @Test
+    @DisplayName("规格c：同键同时存在DB兜底+spool，最终主表仍1条")
+    void sameKeyInDbAndSpoolStaysSingleRow() throws Exception {
+        JdbcTemplate jt = dbWithFallbackTable();
+        Object[] args = {"S001", "413999999", "RMC", "SERIAL",
+                java.time.LocalDateTime.of(2026, 9, 19, 10, 0, 0),
+                31.2, 121.5, 12.0, 180.0, 180.0, 180.0, 0.0, 10.0, 8, 1.0, 1, "A"};
+        String sharedKey = "shared-key-c-1";
+        jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, replay_id, payload, error)"
+                        + " VALUES (?,?,?,?,?)",
+                "gps", "413999999", sharedKey,
+                com.smartship.edge.persist.FileFallbackStore.argsToJson(
+                        "gps", "413999999", sharedKey, args),
+                "boom");
+
+        com.smartship.edge.persist.FileFallbackStore store =
+                new com.smartship.edge.persist.FileFallbackStore(tempDir, 1024L * 1024L, 10L * 1024L * 1024L);
+        store.spool("gps", "413999999", sharedKey, args);
+
+        EdgeProperties properties = new EdgeProperties();
+        FallbackReplayer replayer = new FallbackReplayer(jt, properties, store,
+                new SmartShipMetrics(new SimpleMeterRegistry()));
+        replayer.replay();
+
+        assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class),
+                "同键双通道回放必须去重，主表仍1条");
+        assertEquals(0L, jt.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class),
+                "DB兜底行照常删除");
+        assertTrue(store.pendingFiles().isEmpty(), "spool文件照常清理");
     }
 }

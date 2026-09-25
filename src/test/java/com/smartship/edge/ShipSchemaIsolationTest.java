@@ -37,6 +37,8 @@ class ShipSchemaIsolationTest {
             assertTrue(shipSql.contains("UNIQUE KEY uk_" + table + "_replay_id (replay_id)"),
                     table + " 表必须有 replay_id 唯一约束");
         }
+        assertTrue(shipSql.contains("UNIQUE KEY uk_failed_replay_id (replay_id)"),
+                "兜底表必须有 replay_id 唯一约束");
 
         // 分船注册表文件必须已删除（单船模式无主认证库）
         ClassPathResource authSchemaRes = new ClassPathResource("schema/auth-schema.sql");

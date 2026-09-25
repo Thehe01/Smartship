@@ -119,11 +119,14 @@ class WriteBatcherTest {
     }
 
     @Test
-    @DisplayName("EnginePoint 空 mmsi/时间直接失败")
+    @DisplayName("EnginePoint 空 mmsi/时间/replayId 直接失败")
     void enginePointValidation() {
         assertThrows(IllegalArgumentException.class, () ->
                 EnginePoint.now("", 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
         assertThrows(IllegalArgumentException.class, () ->
-                new EnginePoint("m", 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, null));
+                new EnginePoint("m", 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, null, "r-1"));
+        assertThrows(IllegalArgumentException.class, () ->
+                new EnginePoint("m", 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        java.time.LocalDateTime.now(), " "));
     }
 }

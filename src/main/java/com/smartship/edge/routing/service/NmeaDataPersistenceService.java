@@ -66,60 +66,67 @@ public class NmeaDataPersistenceService {
             INSERT INTO zncb_gps_data (ship_id, mmsi, sentence_type, source, timestamp,
                 latitude, longitude, speed_knots, course_over_ground,
                 heading_true, heading_magnetic, magnetic_variation,
-                altitude_m, satellites, hdop, position_quality, gps_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                altitude_m, satellites, hdop, position_quality, gps_status, replay_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """;
 
     private static final String WIND_SQL = """
             INSERT INTO zncb_wind_data (ship_id, mmsi, sentence_type, source, timestamp,
                 apparent_wind_angle, apparent_wind_speed,
-                true_wind_angle, true_wind_direction, true_wind_speed)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                true_wind_angle, true_wind_direction, true_wind_speed, replay_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """;
 
     private static final String DEPTH_SQL = """
             INSERT INTO zncb_depth_data (ship_id, mmsi, sentence_type, source, timestamp,
-                depth_m, transducer_offset_m)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                depth_m, transducer_offset_m, replay_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """;
 
     private static final String RUDDER_SQL = """
-            INSERT INTO zncb_rudder_data (ship_id, mmsi, sentence_type, source, timestamp, rudder_angle)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO zncb_rudder_data (ship_id, mmsi, sentence_type, source, timestamp, rudder_angle, replay_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """;
 
     private static final String ENGINE_SQL = """
             INSERT INTO zncb_engine_data (ship_id, mmsi, slave_id, protocol, timestamp,
                 rpm, coolant_temp, lube_oil_press, fuel_press, exhaust_temp,
                 tc_air_press, start_air_press, bearing_temp, battery_volt,
-                running_hours, status, alarm_bits1, alarm_bits2)
-            VALUES (?, ?, ?, 'MODBUS_TCP', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                running_hours, status, alarm_bits1, alarm_bits2, replay_id)
+            VALUES (?, ?, ?, 'MODBUS_TCP', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """;
 
     private static final String FALLBACK_SQL = """
-            INSERT INTO zncb_failed_writes (stream, mmsi, payload, error)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO zncb_failed_writes (stream, mmsi, replay_id, payload, error)
+            VALUES (?, ?, ?, ?, ?)
             """;
 
     /**
-     * 耐久写入：主表一次 + 瞬态重试一次，重试耗尽后转存本地兜底表。
+     * 耐久写入：主表一次 + 瞬态重试一次，重试耗尽后转三级兜底。
      *
-     * <p>调用方（采集聚合缓存）取走快照即清空内存，DB 失败若只记日志就会在进入本地
-     * 可靠存储前丢数。本方法保证：瞬态抖动由一次即时重试吸收；持续故障转存
-     * {@code zncb_failed_writes}（同库事务外 best-effort，附带流类型与截断参数），
-     * 并累加 {@code smartship_persistence_fallback_total} 告警。返回 true 仅当主表
-     * 落库成功；兜底表自身失败不抛异常（调用方仍按失败计数，绝不静默按成功算）。
+     * <p>统一幂等键：{@code replayId} 由调用方在持久化入口生成一次（单行方法内、
+     * EnginePoint 入批时），首次写入与即时重试复用同一个值。主表有
+     * {@code UNIQUE(replay_id)}，因此“已提交但返回异常”的未知结果窗口会被去重吸收：
+     * 任何 {@code DuplicateKeyException} 都直接视为成功。
      */
-    private boolean updateDurable(String stream, String mmsi, String sql, Object[] args) {
+    private boolean updateDurable(
+            String stream, String mmsi, String replayId, String sql, Object[] baseArgs) {
+        Object[] args = withReplayId(baseArgs, replayId);
         try {
             jdbcTemplate.update(sql, args);
+            return true;
+        } catch (org.springframework.dao.DuplicateKeyException dup) {
+            log.info("[Persist-{}] 主表已存在同 replay_id，视为成功（未知结果窗口吸收）", stream);
             return true;
         } catch (Exception first) {
             try {
                 jdbcTemplate.update(sql, args);
                 return true;
+            } catch (org.springframework.dao.DuplicateKeyException dup2) {
+                log.info("[Persist-{}] 重试命中同 replay_id，视为成功", stream);
+                return true;
             } catch (Exception second) {
-                writeFallback(stream, mmsi, args, second.getMessage());
+                writeFallback(stream, mmsi, replayId, baseArgs, messageOf(second));
                 log.warn("[Persist-{}] 主表写入两次均失败，已转本地兜底: {}",
                         stream, second.getMessage());
                 return false;
@@ -127,23 +134,51 @@ public class NmeaDataPersistenceService {
         }
     }
 
-    private void writeFallback(String stream, String mmsi, Object[] args, String error) {
-        // tier 1：同库兜底表（可查询、可审计；payload 存可回放 JSON，回放器会重写入主表）
-        try {
-            String payload = truncate(FileFallbackStore.argsToJson(stream, mmsi, args), 65535);
-            String err = truncate(error, 500);
-            jdbcTemplate.update(FALLBACK_SQL, stream, mmsi, payload, err);
-            if (metrics != null) {
-                metrics.recordPersistenceFallback(stream);
+    private static String messageOf(Exception e) {
+        return e.getMessage() == null ? e.toString() : e.getMessage();
+    }
+
+    private static Object[] withReplayId(Object[] baseArgs, String replayId) {
+        Object[] full = java.util.Arrays.copyOf(baseArgs, baseArgs.length + 1);
+        full[baseArgs.length] = replayId;
+        return full;
+    }
+
+    /** 持久化入口统一幂等键：调用方生成一次，全链路复用，禁止下游重新生成。 */
+    static String newReplayId() {
+        return java.util.UUID.randomUUID().toString();
+    }
+
+    private void writeFallback(
+            String stream, String mmsi, String replayId, Object[] baseArgs, String error) {
+        // tier 1：同库兜底表（可查询、可审计；payload 存可回放 JSON，回放器会重写入主表）。
+        // 兜底写入同样重试一次；命中 replay_id 唯一约束说明已兜底，直接返回不再进 spool。
+        Exception last = null;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                String payload = truncate(
+                        FileFallbackStore.argsToJson(stream, mmsi, replayId, baseArgs), 65535);
+                String err = truncate(error, 500);
+                jdbcTemplate.update(FALLBACK_SQL, stream, mmsi, replayId, payload, err);
+                if (metrics != null) {
+                    metrics.recordPersistenceFallback(stream);
+                }
+                return;
+            } catch (org.springframework.dao.DuplicateKeyException dup) {
+                log.info("[Persist-{}] 兜底表已存在同 replay_id，不再进 spool", stream);
+                if (metrics != null) {
+                    metrics.recordPersistenceFallback(stream);
+                }
+                return;
+            } catch (Exception e) {
+                last = e;
             }
-            return;
-        } catch (Exception e) {
-            log.warn("[Persist-{}] 兜底表亦不可写（MySQL 可能整体故障），转磁盘 spool: {}",
-                    stream, e.getMessage());
         }
-        // tier 2：磁盘 spool（MySQL 全挂也丢不了，回放器稍后重放）
+        log.warn("[Persist-{}] 兜底表亦不可写（MySQL 可能整体故障），转磁盘 spool: {}",
+                stream, last != null ? last.getMessage() : "");
+        // tier 2：磁盘 spool（MySQL 全挂也丢不了，回放器稍后重放；复用同一个 replayId）
         try {
-            long dropped = fallbackStore.spool(stream, mmsi, args);
+            long dropped = fallbackStore.spool(stream, mmsi, replayId, baseArgs);
             if (metrics != null) {
                 metrics.recordPersistenceFallback(stream);
                 if (dropped > 0) {
@@ -167,7 +202,9 @@ public class NmeaDataPersistenceService {
     }
 
     /**
-     * 流标识 → 主表 INSERT SQL（供磁盘 spool 回放器使用）。未知流返回 null。
+     * 流标识 → 主表 INSERT SQL（含 {@code replay_id} 列）。回放复用同一语句，
+     * 重复由唯一约束 + 调用方 {@code DuplicateKeyException} 吸收解决，
+     * 不需要第二套 SQL。未知流返回 null。
      */
     public static String sqlForStream(String stream) {
         if (stream == null) {
@@ -181,35 +218,6 @@ public class NmeaDataPersistenceService {
             case "engine", "engine-batch" -> ENGINE_SQL;
             default -> null;
         };
-    }
-
-    /**
-     * 流标识 → 回放 INSERT SQL：在基础 SQL 上追加 {@code replay_id} 列与占位。
-     * <p>重复吸收不靠方言 {@code ON DUPLICATE KEY UPDATE}（H2 测不了、MySQL 才有），
-     * 而靠调用方捕获 {@code DuplicateKeyException} 视为成功：唯一约束保证同一
-     * replay_id 只有一条物理行，重放即幂等。Spring 在 MySQL/H2 下都把唯一冲突翻译
-     * 为该异常，单条代码路径两边可测。
-     * <p>由基础 SQL 派生而非手写第二套列清单：列清单只维护一份，派生逻辑由单测 pin 住。
-     */
-    public static String replaySqlForStream(String stream) {
-        String base = sqlForStream(stream);
-        if (base == null) {
-            return null;
-        }
-        // 注意：text block 会剥离缩进，VALUES 行首是换行符而非空格。
-        int v = base.lastIndexOf("VALUES ");
-        if (v < 0) {
-            throw new IllegalStateException("unexpected INSERT shape for stream=" + stream);
-        }
-        String head = base.substring(0, v);
-        String tail = base.substring(v);
-        int colsEnd = head.lastIndexOf(')');
-        int holdersEnd = tail.lastIndexOf(')');
-        if (colsEnd < 0 || holdersEnd < 0) {
-            throw new IllegalStateException("unexpected INSERT shape for stream=" + stream);
-        }
-        return head.substring(0, colsEnd) + ", replay_id)"
-                + tail.substring(0, holdersEnd) + ", ?)";
     }
 
     @Async("persistenceExecutor")
@@ -226,7 +234,8 @@ public class NmeaDataPersistenceService {
                 lat, lon, speedKnots, course,
                 headingTrue, headingMag, magVar,
                 altitude, satellites, hdop, quality, gpsStatus};
-        if (updateDurable("gps", mmsi, GPS_SQL, args)) {
+        String replayId = newReplayId();
+        if (updateDurable("gps", mmsi, replayId, GPS_SQL, args)) {
             if (metrics != null) {
                 metrics.recordPersistenceSuccess("gps", System.nanoTime() - startNanos);
             }
@@ -249,7 +258,8 @@ public class NmeaDataPersistenceService {
         Object[] args = new Object[]{shipId, mmsi, sentenceType, source, LocalDateTime.now(),
                 apparentAngle, apparentSpeed,
                 trueAngle, trueDirection, trueSpeed};
-        if (updateDurable("wind", mmsi, WIND_SQL, args)) {
+        String replayId = newReplayId();
+        if (updateDurable("wind", mmsi, replayId, WIND_SQL, args)) {
             if (metrics != null) {
                 metrics.recordPersistenceSuccess("wind", System.nanoTime() - startNanos);
             }
@@ -268,7 +278,8 @@ public class NmeaDataPersistenceService {
         long startNanos = System.nanoTime();
         String shipId = currentShipId();
         Object[] args = new Object[]{shipId, mmsi, sentenceType, source, LocalDateTime.now(), depthM, offsetM};
-        if (updateDurable("depth", mmsi, DEPTH_SQL, args)) {
+        String replayId = newReplayId();
+        if (updateDurable("depth", mmsi, replayId, DEPTH_SQL, args)) {
             if (metrics != null) {
                 metrics.recordPersistenceSuccess("depth", System.nanoTime() - startNanos);
             }
@@ -287,7 +298,8 @@ public class NmeaDataPersistenceService {
         long startNanos = System.nanoTime();
         String shipId = currentShipId();
         Object[] args = new Object[]{shipId, mmsi, sentenceType, source, LocalDateTime.now(), rudderAngle};
-        if (updateDurable("rudder", mmsi, RUDDER_SQL, args)) {
+        String replayId = newReplayId();
+        if (updateDurable("rudder", mmsi, replayId, RUDDER_SQL, args)) {
             if (metrics != null) {
                 metrics.recordPersistenceSuccess("rudder", System.nanoTime() - startNanos);
             }
@@ -313,7 +325,8 @@ public class NmeaDataPersistenceService {
                 rpm, coolantTemp, lubeOilPress, fuelPress, exhaustTemp,
                 tcAirPress, startAirPress, bearingTemp, batteryVolt,
                 runningHours, status, alarmBits1, alarmBits2};
-        if (updateDurable("engine", mmsi, ENGINE_SQL, args)) {
+        String replayId = newReplayId();
+        if (updateDurable("engine", mmsi, replayId, ENGINE_SQL, args)) {
             if (metrics != null) {
                 metrics.recordPersistenceSuccess("engine", System.nanoTime() - startNanos);
             }
@@ -357,7 +370,8 @@ public class NmeaDataPersistenceService {
     private int writeEngineGroup(String shipId, List<EnginePoint> group) {
         List<Object[]> args = new ArrayList<>(group.size());
         for (EnginePoint p : group) {
-            args.add(engineArgs(shipId, p));
+            // 入批时的 replayId 全程复用：batch、逐行 retry、兜底、回放、上传 msg_id 同键。
+            args.add(withReplayId(engineArgs(shipId, p), p.replayId()));
         }
         javax.sql.DataSource ds = java.util.Objects.requireNonNull(
                 jdbcTemplate.getDataSource(), "JdbcTemplate DataSource");
@@ -400,7 +414,8 @@ public class NmeaDataPersistenceService {
             }
             // 连接都拿不到（DB 整体故障）：整批直接进三级兜底，绝不静默丢失。
             for (int i = 0; i < args.size(); i++) {
-                writeFallback("engine", group.get(i).mmsi(), args.get(i), ex.getMessage());
+                writeFallback("engine", group.get(i).mmsi(), group.get(i).replayId(),
+                        engineArgs(shipId, group.get(i)), ex.getMessage());
             }
             log.warn("[Persist-EngineBatch] 分组写入异常，{} 行已转三级兜底: {}",
                     args.size(), ex.getMessage());
@@ -439,12 +454,16 @@ public class NmeaDataPersistenceService {
         int rows = 0;
         for (int i = 0; i < args.size(); i++) {
             Object[] arg = args.get(i);
-            String mmsi = group.get(i).mmsi();
+            EnginePoint point = group.get(i);
             boolean ok = false;
             String lastError = "";
             for (int attempt = 0; attempt < 2 && !ok; attempt++) {
                 try {
                     ok = jdbcTemplate.update(ENGINE_BATCH_SQL, arg) == 1;
+                } catch (org.springframework.dao.DuplicateKeyException dup) {
+                    // 已提交但返回异常的未知结果窗口：同 replay_id 已在，直接成功。
+                    log.info("[Persist-EngineBatch] 补写命中同 replay_id，视为成功");
+                    ok = true;
                 } catch (Exception retryEx) {
                     lastError = retryEx.getMessage();
                     if (attempt == 1) {
@@ -456,10 +475,16 @@ public class NmeaDataPersistenceService {
             if (ok) {
                 rows++;
             } else {
-                writeFallback("engine", mmsi, arg, lastError);
+                writeFallback("engine", point.mmsi(), point.replayId(),
+                        engineArgs(shipIdOf(point), point), lastError);
             }
         }
         return rows;
+    }
+
+    private String shipIdOf(EnginePoint point) {
+        String sid = properties.getShipId();
+        return (sid != null && !sid.isEmpty()) ? sid : point.mmsi();
     }
 
     /**

@@ -85,10 +85,11 @@ public class FallbackReplayer {
             final List<DbRow> rows;
             try {
                 rows = jdbcTemplate.query(
-                        "SELECT id, stream, mmsi, payload FROM zncb_failed_writes"
+                        "SELECT id, stream, mmsi, replay_id, payload FROM zncb_failed_writes"
                                 + " WHERE id > ? ORDER BY id ASC LIMIT ?",
                         (rs, n) -> new DbRow(rs.getLong("id"), rs.getString("stream"),
-                                rs.getString("mmsi"), rs.getString("payload")),
+                                rs.getString("mmsi"), rs.getString("replay_id"),
+                                rs.getString("payload")),
                         cursor, pageSize);
             } catch (Exception e) {
                 log.debug("[Fallback-Replay] 兜底表不可读，跳过 DB 阶段: {}", e.getMessage());
@@ -124,7 +125,9 @@ public class FallbackReplayer {
                     }
                     continue;
                 }
-                if (replayDbRow(row, parsed)) {
+                // 幂等键以兜底表列为准（写入时与 payload 同值），老诊断行列为空才退到 JSON。
+                String rid = hasText(row.replayId()) ? row.replayId() : parsed.replayId();
+                if (replayDbRow(row, parsed, rid)) {
                     rowAttempts.remove(key);
                     replayed++;
                 } else {
@@ -137,7 +140,7 @@ public class FallbackReplayer {
         return budget - replayed;
     }
 
-    private record DbRow(long id, String stream, String mmsi, String payload) {
+    private record DbRow(long id, String stream, String mmsi, String replayId, String payload) {
     }
 
     /**
@@ -145,9 +148,10 @@ public class FallbackReplayer {
      * <p>崩溃要么全有要么全无——消灭“写完主表、没删兜底行”导致的重复窗口
      * （重复行的自增 id 不同会导致岸端 msg_id 不同而无法去重）。
      */
-    private boolean replayDbRow(DbRow row, FileFallbackStore.ParsedLine parsed) {
-        String sql = NmeaDataPersistenceService.replaySqlForStream(parsed.stream());
-        Object[] jdbcArgs = withReplayId(parsed);
+    private boolean replayDbRow(
+            DbRow row, FileFallbackStore.ParsedLine parsed, String replayId) {
+        String sql = NmeaDataPersistenceService.sqlForStream(parsed.stream());
+        Object[] jdbcArgs = withReplayId(parsed, replayId);
         javax.sql.DataSource ds = jdbcTemplate.getDataSource();
         if (ds == null) {
             if (metrics != null) {
@@ -218,21 +222,13 @@ public class FallbackReplayer {
     /** 通用单行回放：成功/失败计数，失败不抛（重复由主表 replay_id 唯一约束吸收）。 */
     private boolean replayParsed(
             String stream, String replayId, List<FileFallbackStore.TypedArg> args) {
-        String base = NmeaDataPersistenceService.sqlForStream(stream);
-        if (base == null) {
+        String sql = NmeaDataPersistenceService.sqlForStream(stream);
+        if (sql == null) {
             log.warn("[Fallback-Replay] 未知流 {}，跳过（计数丢失）", stream);
             if (metrics != null) {
                 metrics.recordFallbackDropped(1);
             }
             return true;
-        }
-        String sql;
-        try {
-            sql = NmeaDataPersistenceService.replaySqlForStream(stream);
-        } catch (Exception e) {
-            log.warn("[Fallback-Replay] 回放 SQL 派生失败保留现场: stream={}, err={}",
-                    stream, e.getMessage());
-            return false;
         }
         try {
             Object[] decoded = args.stream().map(FileFallbackStore::decode).toArray();
@@ -261,12 +257,16 @@ public class FallbackReplayer {
         }
     }
 
-    private Object[] withReplayId(FileFallbackStore.ParsedLine parsed) {
+    private Object[] withReplayId(FileFallbackStore.ParsedLine parsed, String replayId) {
         Object[] decoded =
                 parsed.args().stream().map(FileFallbackStore::decode).toArray();
         Object[] jdbcArgs = java.util.Arrays.copyOf(decoded, decoded.length + 1);
-        jdbcArgs[decoded.length] = parsed.replayId();
+        jdbcArgs[decoded.length] = replayId;
         return jdbcArgs;
+    }
+
+    private static boolean hasText(String s) {
+        return s != null && !s.isBlank();
     }
 
     /**

@@ -112,7 +112,7 @@ public class ObservabilityMetricsTest {
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
                     ship_id VARCHAR(64),
                     mmsi VARCHAR(32),
-                    sentence_type VARCHAR(16),
+                    sentence_type VARCHAR(16), replay_id VARCHAR(64) NULL,
                     source VARCHAR(32),
                     timestamp DATETIME,
                     latitude DOUBLE,
@@ -266,7 +266,7 @@ public class ObservabilityMetricsTest {
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
                     ship_id VARCHAR(64),
                     mmsi VARCHAR(32),
-                    sentence_type VARCHAR(16)
+                    sentence_type VARCHAR(16), replay_id VARCHAR(64) NULL
                 )
                 """);
         jt.execute("""
@@ -367,7 +367,7 @@ public class ObservabilityMetricsTest {
         jt.execute("""
                 CREATE TABLE IF NOT EXISTS zncb_gps_data (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    sentence_type VARCHAR(16)
+                    sentence_type VARCHAR(16), replay_id VARCHAR(64) NULL
                 )
                 """);
         jt.execute("""

@@ -91,13 +91,17 @@ public class FileFallbackStore {
      * 转存一行可回放记录。返回本轮丢失行数（超限删除的旧行 + 超大单行拒收计 1，
      * 调用方计数告警）。正常路径返回 0。
      *
+     * <p>{@code replayId} 必须由调用方在持久化入口生成并全程复用，本方法禁止再生成
+     * （否则 DB 兜底行与 spool 行各持一键，回放成两条逻辑数据）。
+     *
      * <p>严格有界：写前先把总量（含 active 文件）+ 本行压到上限内——必要时先滚动
      * active 使其参与清理；单行超过总量上限直接拒收。写后复检兜底。因此实际占用
      * 永不超过 {@code maxTotalBytes + 一行}，而不是“上限 + 整个 active 文件”。
      */
-    public synchronized long spool(String stream, String mmsi, Object[] args) throws IOException {
+    public synchronized long spool(String stream, String mmsi, String replayId, Object[] args)
+            throws IOException {
         Files.createDirectories(dir);
-        byte[] line = (argsToJson(stream, mmsi, args) + "\n").getBytes(StandardCharsets.UTF_8);
+        byte[] line = (argsToJson(stream, mmsi, replayId, args) + "\n").getBytes(StandardCharsets.UTF_8);
         if (line.length > maxTotalBytes) {
             log.warn("[Fallback] 单行 {} bytes 超总量上限 {}，拒绝写入并计数丢失",
                     line.length, maxTotalBytes);
@@ -117,11 +121,6 @@ public class FileFallbackStore {
     }
 
     /** 单行记录编码（文件 spool 与 DB 兜底表共用同一格式，保证两处都可回放）。 */
-    public static String argsToJson(String stream, String mmsi, Object[] args) {
-        return argsToJson(stream, mmsi, java.util.UUID.randomUUID().toString(), args);
-    }
-
-    /** 同上，replay_id 由调用方指定（测试 pin 住确定性时使用）。 */
     public static String argsToJson(String stream, String mmsi, String replayId, Object[] args) {
         ObjectNode root = MAPPER.createObjectNode();
         root.put("v", 1);

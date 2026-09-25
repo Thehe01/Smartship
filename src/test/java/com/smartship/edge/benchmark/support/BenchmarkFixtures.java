@@ -25,7 +25,7 @@ public final class BenchmarkFixtures {
         jt.execute("""
                 CREATE TABLE IF NOT EXISTS zncb_gps_data (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    ship_id VARCHAR(64), mmsi VARCHAR(32), sentence_type VARCHAR(16),
+                    ship_id VARCHAR(64), mmsi VARCHAR(32), sentence_type VARCHAR(16), replay_id VARCHAR(64) NULL,
                     source VARCHAR(32), timestamp DATETIME,
                     latitude DOUBLE, longitude DOUBLE, speed_knots DOUBLE,
                     course_over_ground DOUBLE, heading_true DOUBLE, heading_magnetic DOUBLE,
@@ -35,7 +35,7 @@ public final class BenchmarkFixtures {
         jt.execute("""
                 CREATE TABLE IF NOT EXISTS zncb_wind_data (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    ship_id VARCHAR(64), mmsi VARCHAR(32), sentence_type VARCHAR(16),
+                    ship_id VARCHAR(64), mmsi VARCHAR(32), sentence_type VARCHAR(16), replay_id VARCHAR(64) NULL,
                     source VARCHAR(32), timestamp DATETIME,
                     apparent_wind_angle DOUBLE, apparent_wind_speed DOUBLE,
                     true_wind_angle DOUBLE, true_wind_direction DOUBLE, true_wind_speed DOUBLE
@@ -43,14 +43,14 @@ public final class BenchmarkFixtures {
         jt.execute("""
                 CREATE TABLE IF NOT EXISTS zncb_depth_data (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    ship_id VARCHAR(64), mmsi VARCHAR(32), sentence_type VARCHAR(16),
+                    ship_id VARCHAR(64), mmsi VARCHAR(32), sentence_type VARCHAR(16), replay_id VARCHAR(64) NULL,
                     source VARCHAR(32), timestamp DATETIME,
                     depth_m DOUBLE, transducer_offset_m DOUBLE
                 )""");
         jt.execute("""
                 CREATE TABLE IF NOT EXISTS zncb_rudder_data (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    ship_id VARCHAR(64), mmsi VARCHAR(32), sentence_type VARCHAR(16),
+                    ship_id VARCHAR(64), mmsi VARCHAR(32), sentence_type VARCHAR(16), replay_id VARCHAR(64) NULL,
                     source VARCHAR(32), timestamp DATETIME, rudder_angle DOUBLE
                 )""");
         jt.execute("""
@@ -61,7 +61,8 @@ public final class BenchmarkFixtures {
                     rpm DOUBLE, coolant_temp DOUBLE, lube_oil_press DOUBLE,
                     fuel_press DOUBLE, exhaust_temp DOUBLE, tc_air_press DOUBLE,
                     start_air_press DOUBLE, bearing_temp DOUBLE, battery_volt DOUBLE,
-                    running_hours INT, status INT, alarm_bits1 INT, alarm_bits2 INT
+                    running_hours INT, status INT, alarm_bits1 INT, alarm_bits2 INT,
+                    replay_id VARCHAR(64) NULL
                 )""");
         jt.execute("""
                 CREATE TABLE IF NOT EXISTS zncb_upload_cursor (

@@ -22,6 +22,9 @@ class ShipLocalInitializerTest {
         jt.execute("CREATE TABLE zncb_gps_data ("
                 + " id BIGINT AUTO_INCREMENT PRIMARY KEY,"
                 + " ship_id VARCHAR(64), mmsi VARCHAR(32))");
+        jt.execute("CREATE TABLE zncb_failed_writes ("
+                + " id BIGINT AUTO_INCREMENT PRIMARY KEY,"
+                + " stream VARCHAR(32), mmsi VARCHAR(32), payload TEXT, error VARCHAR(500))");
         return jt;
     }
 
@@ -46,6 +49,18 @@ class ShipLocalInitializerTest {
                 "S001", "413999999", null);
         assertEquals(3L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class),
                 "NULL 不互斥，正常行不受影响");
+    }
+
+    @Test
+    @DisplayName("兜底表同样补列，老诊断行保留且新行可写同键去重")
+    void migrateFallbackTable() {
+        JdbcTemplate jt = oldShapeDb();
+        ShipLocalInitializer.ensureReplayIdColumns(jt);
+
+        jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, payload, error) VALUES (?,?,?,?)",
+                "gps", "413999999", "{ship_id=S001}", "legacy");
+        assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class),
+                "老诊断行原样保留");
     }
 
     @Test

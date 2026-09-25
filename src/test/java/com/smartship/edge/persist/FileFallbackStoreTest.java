@@ -29,8 +29,8 @@ class FileFallbackStoreTest {
         FileFallbackStore store = store();
         Object[] args = new Object[]{"S001", "413999999", 12.5, 1001L, true, null,
                 LocalDateTime.of(2026, 9, 19, 10, 0, 0)};
-        store.spool("gps", "413999999", args);
-        store.spool("wind", "413999999", new Object[]{"x"});
+        store.spool("gps", "413999999", "r-order-1", args);
+        store.spool("wind", "413999999", "r-order-2", new Object[]{"x"});
 
         List<FileFallbackStore.PendingFile> files = store.pendingFiles();
         assertEquals(1, files.size());
@@ -54,8 +54,8 @@ class FileFallbackStoreTest {
     @DisplayName("rewrite 只保留剩余行，空则删文件")
     void rewriteKeepsRemaining() throws Exception {
         FileFallbackStore store = store();
-        store.spool("gps", "m", new Object[]{"a"});
-        store.spool("gps", "m", new Object[]{"b"});
+        store.spool("gps", "m", "r-rw-1", new Object[]{"a"});
+        store.spool("gps", "m", "r-rw-2", new Object[]{"b"});
         FileFallbackStore.PendingFile file = store.pendingFiles().get(0);
         FileFallbackStore.ReadResult read = store.readAll(file);
 
@@ -75,7 +75,7 @@ class FileFallbackStoreTest {
         String big = "x".repeat(800);
         long droppedTotal = 0;
         for (int i = 0; i < 12; i++) {
-            droppedTotal += store.spool("gps", "m", new Object[]{big});
+            droppedTotal += store.spool("gps", "m", "r-cap-" + i, new Object[]{big});
         }
         long total = 0;
         for (FileFallbackStore.PendingFile f : store.pendingFiles()) {
@@ -89,7 +89,7 @@ class FileFallbackStoreTest {
     @DisplayName("单行超总量上限直接拒收并计数，不建文件")
     void oversizedSingleLineRefused() throws Exception {
         FileFallbackStore store = new FileFallbackStore(tempDir, 1024L, 1024L);
-        assertEquals(1, store.spool("gps", "m", new Object[]{"x".repeat(2000)}),
+        assertEquals(1, store.spool("gps", "m", "r-huge-1", new Object[]{"x".repeat(2000)}),
                 "超大单行拒收计 1 行丢失");
         assertTrue(store.pendingFiles().isEmpty(), "拒收不得建文件");
     }
@@ -112,16 +112,16 @@ class FileFallbackStoreTest {
         // 单文件 1KB 上限：大数据行触发滚动
         FileFallbackStore store = new FileFallbackStore(tempDir, 1024L, 10L * 1024L);
         String big = "x".repeat(800);
-        store.spool("gps", "m", new Object[]{big});
-        store.spool("gps", "m", new Object[]{big});
-        store.spool("gps", "m", new Object[]{big});
+        store.spool("gps", "m", "r-rot-1", new Object[]{big});
+        store.spool("gps", "m", "r-rot-2", new Object[]{big});
+        store.spool("gps", "m", "r-rot-3", new Object[]{big});
         assertEquals(2, store.pendingFiles().size(), "超限必须滚动出第二文件");
 
         // 总量 4KB 上限：继续写触发删最老（回归：删后取值曾抛 NoSuchFileException）
         FileFallbackStore capped = new FileFallbackStore(tempDir, 1024L, 4096L);
         long droppedTotal = 0;
         for (int i = 0; i < 8; i++) {
-            droppedTotal += capped.spool("gps", "m", new Object[]{big});
+            droppedTotal += capped.spool("gps", "m", "r-cap2-" + i, new Object[]{big});
         }
         long total = 0;
         for (FileFallbackStore.PendingFile f : capped.pendingFiles()) {

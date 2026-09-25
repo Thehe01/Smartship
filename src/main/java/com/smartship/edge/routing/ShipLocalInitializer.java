@@ -92,6 +92,12 @@ public class ShipLocalInitializer {
                     "ALTER TABLE " + table
                             + " ADD CONSTRAINT uk_" + table + "_replay_id UNIQUE (replay_id)");
         }
+        execIfAbsent(jt, "zncb_failed_writes",
+                "ALTER TABLE zncb_failed_writes"
+                        + " ADD COLUMN replay_id VARCHAR(64) NULL DEFAULT NULL");
+        execIfAbsent(jt, "zncb_failed_writes",
+                "ALTER TABLE zncb_failed_writes"
+                        + " ADD CONSTRAINT uk_failed_replay_id UNIQUE (replay_id)");
     }
 
     private static void execIfAbsent(JdbcTemplate jt, String table, String ddl) {
