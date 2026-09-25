@@ -117,4 +117,28 @@ class ShipLocalInitializerTest {
         // 清理后重复执行依然幂等
         assertDoesNotThrow(() -> ShipLocalInitializer.ensureReplayIdColumns(jt));
     }
+
+    @Test
+    @DisplayName("表内已有重复replay_id时建UNIQUE必须如实失败，不能当幂等放行")
+    void duplicateDataBlocksUnique() {
+        JdbcTemplate jt = oldShapeDb();
+        // 还原存量脏数据现场：列已在、无约束、已有重复值
+        jt.execute("ALTER TABLE zncb_gps_data ADD COLUMN replay_id VARCHAR(64) NULL");
+        jt.update("INSERT INTO zncb_gps_data (ship_id, mmsi, replay_id) VALUES (?,?,?)",
+                "S001", "413999999", "dup");
+        jt.update("INSERT INTO zncb_gps_data (ship_id, mmsi, replay_id) VALUES (?,?,?)",
+                "S001", "413999999", "dup");
+
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> ShipLocalInitializer.ensureReplayIdColumns(jt),
+                "重复数据导致UNIQUE建不起来必须抛，不能误判成已存在而schemaReady=true");
+
+        // 约束确实没建成（复核手段与主代码同源：INFORMATION_SCHEMA）
+        java.util.List<String> constraints = jt.query(
+                "SELECT CONSTRAINT_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS"
+                        + " WHERE TABLE_NAME = 'ZNCB_GPS_DATA' AND CONSTRAINT_TYPE = 'UNIQUE'",
+                (rs, n) -> rs.getString(1));
+        assertTrue(constraints.stream().noneMatch(c -> c.equalsIgnoreCase("UK_GPS_REPLAY_ID")),
+                "约束没建成才是失败的证据，实际=" + constraints);
+    }
 }

@@ -92,27 +92,57 @@ public class ShipLocalInitializer {
         constraints.put("zncb_rudder_data", "uk_rudder_replay_id");
         constraints.put("zncb_engine_data", "uk_engine_replay_id");
         constraints.put("zncb_failed_writes", "uk_failed_replay_id");
-        java.util.Set<String> existing = existingTables(jt);
         java.util.List<String> failed = new java.util.ArrayList<>();
         for (java.util.Map.Entry<String, String> e : constraints.entrySet()) {
             String table = e.getKey();
-            if (existing != null
-                    && !existing.contains(table.toUpperCase(java.util.Locale.ROOT))) {
+            String canonical = e.getValue();
+            if (!tableExists(jt, table)) {
                 // 表本身不存在：建表是 executeShipSchema 的职责（先执行），迁移跳过即可。
                 log.debug("[LocalInit] 存量表 {} 不存在，跳过该表迁移", table);
                 continue;
             }
             // 历史版本曾用表全名建过等价唯一索引，先清掉，避免同列双 UNIQUE。
             dropQuietly(jt, table, "uk_" + table + "_replay_id");
-            if (!execOk(jt, table,
-                    "ALTER TABLE " + table
-                            + " ADD COLUMN replay_id VARCHAR(64) NULL DEFAULT NULL")) {
-                failed.add(table + ":replay_id column");
+            cleanupNonCanonicalUnique(jt, table, canonical);
+            if (!columnExists(jt, table, "replay_id")) {
+                try {
+                    jt.execute("ALTER TABLE " + table
+                            + " ADD COLUMN replay_id VARCHAR(64) NULL DEFAULT NULL");
+                    log.info("[LocalInit] 存量表 {} 迁移成功: ADD COLUMN replay_id", table);
+                } catch (Exception ex) {
+                    // 元数据复核：列已在=幂等成功；表没了=跳过；其余一律真实失败。
+                    // 绝不靠 "Duplicate" 文本判断——表内重复数据导致建 UNIQUE 失败时
+                    // MySQL 同样报 Duplicate entry，必须失败而不能当“已存在”放行。
+                    if (columnExists(jt, table, "replay_id")) {
+                        log.debug("[LocalInit] 存量表 {} 列已存在，跳过", table);
+                    } else if (!tableExists(jt, table)) {
+                        log.debug("[LocalInit] 存量表 {} 已不存在，跳过", table);
+                        continue;
+                    } else {
+                        log.warn("[LocalInit] 存量表 {} 加列失败: {}", table, ex.getMessage());
+                        failed.add(table + ":replay_id column");
+                        continue;
+                    }
+                }
             }
-            if (!execOk(jt, table,
-                    "ALTER TABLE " + table
-                            + " ADD CONSTRAINT " + e.getValue() + " UNIQUE (replay_id)")) {
-                failed.add(table + ":replay_id unique");
+            if (canonicalUniqueExists(jt, table, canonical)) {
+                continue;
+            }
+            try {
+                jt.execute("ALTER TABLE " + table
+                        + " ADD CONSTRAINT " + canonical + " UNIQUE (replay_id)");
+                log.info("[LocalInit] 存量表 {} 迁移成功: ADD CONSTRAINT {}", table, canonical);
+            } catch (Exception ex) {
+                // 元数据复核：约束已在=幂等成功（并发/重跑）；表没了=跳过；
+                // 其余一律真实失败——包括表内已有重复 replay_id 导致 UNIQUE 建不起来的情况。
+                if (canonicalUniqueExists(jt, table, canonical)) {
+                    log.debug("[LocalInit] 存量表 {} 约束 {} 已存在，跳过", table, canonical);
+                } else if (!tableExists(jt, table)) {
+                    log.debug("[LocalInit] 存量表 {} 已不存在，跳过", table);
+                } else {
+                    log.warn("[LocalInit] 存量表 {} 建唯一约束失败: {}", table, ex.getMessage());
+                    failed.add(table + ":replay_id unique");
+                }
             }
         }
         if (!failed.isEmpty()) {
@@ -120,92 +150,199 @@ public class ShipLocalInitializer {
         }
     }
 
-    /** 已存在表名（大写）；查不到时返回 null（调用方照常尝试 DDL，靠异常判定）。 */
-    private static java.util.Set<String> existingTables(JdbcTemplate jt) {
+    /**
+     * 结构存在性一律走元数据/INFORMATION_SCHEMA，不靠异常文本：
+     * <ul>
+     *   <li>表是否存在：{@code DatabaseMetaData#getTables}</li>
+     *   <li>列是否存在：{@code DatabaseMetaData#getColumns}</li>
+     *   <li>规范唯一约束是否存在：{@code INFORMATION_SCHEMA.TABLE_CONSTRAINTS}</li>
+     * </ul>
+     * 这样“表内已有重复 replay_id 导致建 UNIQUE 失败（MySQL Duplicate entry）”
+     * 不会被误判成“约束已存在”而放行，而是复核元数据发现约束确实没建成，如实失败。
+     */
+    private static boolean tableExists(JdbcTemplate jt, String table) {
         try {
-            return jt.execute((org.springframework.jdbc.core.ConnectionCallback<java.util.Set<String>>) con -> {
-                java.util.Set<String> names = new java.util.HashSet<>();
-                try (java.sql.ResultSet rs = con.getMetaData()
-                        .getTables(null, null, "%", new String[]{"TABLE"})) {
-                    while (rs.next()) {
-                        String name = rs.getString("TABLE_NAME");
-                        if (name != null) {
-                            names.add(name.toUpperCase(java.util.Locale.ROOT));
+            Boolean found = jt.execute(
+                    (org.springframework.jdbc.core.ConnectionCallback<Boolean>) con -> {
+                        for (String pattern : new String[]{table, table.toUpperCase(
+                                java.util.Locale.ROOT)}) {
+                            try (java.sql.ResultSet rs = con.getMetaData()
+                                    .getTables(null, null, pattern, new String[]{"TABLE"})) {
+                                while (rs.next()) {
+                                    String name = rs.getString("TABLE_NAME");
+                                    if (name != null && name.equalsIgnoreCase(table)) {
+                                        return true;
+                                    }
+                                }
+                            }
                         }
-                    }
-                }
-                return names;
-            });
+                        return false;
+                    });
+            if (found == null) {
+                // 回调没跑起来（未知），按“表在”处理照常尝试 DDL，靠复核判定成败。
+                return true;
+            }
+            if (found) {
+                return true;
+            }
+            return tryInformationSchemaTable(jt, table);
         } catch (Exception e) {
-            log.debug("[LocalInit] 表清单查询失败，逐表尝试迁移: {}", e.getMessage());
-            return null;
+            // 元数据查不到时按“表在”处理，照常尝试 DDL，靠复核判定成败。
+            log.debug("[LocalInit] 表存在性查询失败，按存在处理: {}", e.getMessage());
+            return true;
         }
     }
 
-    /** 重复执行安全：已存在直接忽略；返回 false 仅当真实异常。 */
-    private static boolean execOk(JdbcTemplate jt, String table, String ddl) {
+    private static boolean tryInformationSchemaTable(JdbcTemplate jt, String table) {
         try {
-            jt.execute(ddl);
-            log.info("[LocalInit] 存量表 {} 迁移成功: {}", table,
-                    ddl.substring(0, Math.min(80, ddl.length())));
-            return true;
-        } catch (Exception e) {
-            if (isDuplicateSignal(e) || isMissingObjectSignal(e)) {
-                log.debug("[LocalInit] 存量表 {} 已有该结构/无需迁移，跳过", table);
+            Long n = jt.queryForObject(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE UPPER(TABLE_NAME) = '"
+                            + table.toUpperCase(java.util.Locale.ROOT) + "'",
+                    Long.class);
+            if (n == null) {
                 return true;
             }
-            log.warn("[LocalInit] 存量表 {} 迁移失败: {}", table, e.getMessage());
+            return n > 0;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static boolean columnExists(JdbcTemplate jt, String table, String column) {
+        try {
+            Boolean found = jt.execute(
+                    (org.springframework.jdbc.core.ConnectionCallback<Boolean>) con -> {
+                        for (String tPattern : new String[]{table, table.toUpperCase(
+                                java.util.Locale.ROOT)}) {
+                            try (java.sql.ResultSet rs = con.getMetaData()
+                                    .getColumns(null, null, tPattern, "%")) {
+                                while (rs.next()) {
+                                    String name = rs.getString("COLUMN_NAME");
+                                    if (name != null && name.equalsIgnoreCase(column)) {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                        return false;
+                    });
+            return Boolean.TRUE.equals(found);
+        } catch (Exception e) {
+            log.debug("[LocalInit] 列存在性查询失败，按不存在处理: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    /** 规范名唯一约束是否存在（大小写不敏感）。查不到/异常一律按“不存在”处理。 */
+    private static boolean canonicalUniqueExists(JdbcTemplate jt, String table, String canonical) {
+        try {
+            Long n = jt.queryForObject(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS"
+                            + " WHERE UPPER(TABLE_NAME) = '"
+                            + table.toUpperCase(java.util.Locale.ROOT) + "'"
+                            + " AND UPPER(CONSTRAINT_NAME) = '"
+                            + canonical.toUpperCase(java.util.Locale.ROOT) + "'"
+                            + " AND CONSTRAINT_TYPE = 'UNIQUE'",
+                    Long.class);
+            if (n != null && n > 0) {
+                return true;
+            }
+        } catch (Exception e) {
+            log.debug("[LocalInit] 约束存在性查询失败，改用索引元数据复核: {}", e.getMessage());
+        }
+        // 兜底：索引元数据里找规范名（H2 后台索引名可能加后缀，这里只做精确复核的补充）。
+        try {
+            Boolean found = jt.execute(
+                    (org.springframework.jdbc.core.ConnectionCallback<Boolean>) con -> {
+                        try (java.sql.ResultSet rs = con.getMetaData()
+                                .getIndexInfo(null, null, table, true, false)) {
+                            while (rs.next()) {
+                                String idx = rs.getString("INDEX_NAME");
+                                if (idx != null && idx.equalsIgnoreCase(canonical)) {
+                                    return true;
+                                }
+                            }
+                        } catch (Exception ignored) {
+                            // 某些驱动对大小写敏感，再试大写表名
+                        }
+                        try (java.sql.ResultSet rs = con.getMetaData().getIndexInfo(
+                                null, null, table.toUpperCase(java.util.Locale.ROOT), true, false)) {
+                            while (rs.next()) {
+                                String idx = rs.getString("INDEX_NAME");
+                                if (idx != null && idx.equalsIgnoreCase(canonical)) {
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    });
+            return Boolean.TRUE.equals(found);
+        } catch (Exception e) {
+            log.debug("[LocalInit] 索引元数据复核失败，按约束不存在处理: {}", e.getMessage());
             return false;
         }
     }
 
     /**
-     * 重复列/约束：扫整条 cause 链（Spring 顶层 message 不带数据库原文，
-     * 只看它永远匹配不上）+ SQLState 兜底。
+     * Best-effort 清理落在 {@code replay_id} 上的非规范名唯一索引（历史长名等），
+     * 避免同列双 UNIQUE。找不到/删不掉一律忽略，不影响主流程。
      */
-    private static boolean isDuplicateSignal(Exception e) {
-        String state = sqlStateOf(e);
-        if (state != null && state.startsWith("42S21")) {
-            return true;
-        }
-        String text = fullChainText(e);
-        return text.contains("Duplicate") || text.contains("duplicate")
-                || text.contains("already exists") || text.contains("already Exists");
-    }
-
-    /** 缺表/缺对象：同上，扫整条链。建表是 schema 步骤的职责，迁移跳过。 */
-    private static boolean isMissingObjectSignal(Exception e) {
-        String state = sqlStateOf(e);
-        if (state != null && state.startsWith("42S02")) {
-            return true;
-        }
-        String lower = fullChainText(e).toLowerCase(java.util.Locale.ROOT);
-        return lower.contains("not found") || lower.contains("doesn't exist");
-    }
-
-    /** 整条 cause 链文本（Spring 包装异常的原文藏在 cause 里）。 */
-    private static String fullChainText(Throwable t) {
-        StringBuilder sb = new StringBuilder();
-        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
-            sb.append(String.valueOf(cur.getMessage())).append('\n');
-            if (cur.getCause() == cur) {
-                break;
+    private static void cleanupNonCanonicalUnique(JdbcTemplate jt, String table, String canonical) {
+        try {
+            java.util.List<String> extras = jt.execute(
+                    (org.springframework.jdbc.core.ConnectionCallback<java.util.List<String>>) con -> {
+                        java.util.Map<String, java.util.List<String>> colsByIndex =
+                                new java.util.LinkedHashMap<>();
+                        for (String tPattern : new String[]{table, table.toUpperCase(
+                                java.util.Locale.ROOT)}) {
+                            try (java.sql.ResultSet rs = con.getMetaData()
+                                    .getIndexInfo(null, null, tPattern, true, false)) {
+                                while (rs.next()) {
+                                    boolean nonUnique;
+                                    try {
+                                        nonUnique = rs.getBoolean("NON_UNIQUE");
+                                    } catch (Exception ignored) {
+                                        continue;
+                                    }
+                                    if (nonUnique) {
+                                        continue;
+                                    }
+                                    String idx = rs.getString("INDEX_NAME");
+                                    String col = rs.getString("COLUMN_NAME");
+                                    if (idx == null || col == null) {
+                                        continue;
+                                    }
+                                    colsByIndex.computeIfAbsent(idx,
+                                            k -> new java.util.ArrayList<>()).add(col);
+                                }
+                            } catch (Exception ignored) {
+                                // 换下一种表名大小写再试
+                            }
+                        }
+                        java.util.List<String> out = new java.util.ArrayList<>();
+                        for (java.util.Map.Entry<String, java.util.List<String>> en
+                                : colsByIndex.entrySet()) {
+                            if (en.getKey().equalsIgnoreCase(canonical)) {
+                                continue;
+                            }
+                            for (String c : en.getValue()) {
+                                if (c.equalsIgnoreCase("replay_id")) {
+                                    out.add(en.getKey());
+                                    break;
+                                }
+                            }
+                        }
+                        return out;
+                    });
+            if (extras == null) {
+                return;
             }
-        }
-        return sb.toString();
-    }
-
-    /** 沿 cause 链找底层 SQLException 的 SQLState。 */
-    private static String sqlStateOf(Throwable t) {
-        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
-            if (cur instanceof java.sql.SQLException se && se.getSQLState() != null) {
-                return se.getSQLState();
+            for (String idx : extras) {
+                dropQuietly(jt, table, idx);
             }
-            if (cur.getCause() == cur) {
-                break;
-            }
+        } catch (Exception e) {
+            log.debug("[LocalInit] 非规范唯一索引清理跳过: {}", e.getMessage());
         }
-        return null;
     }
 
     /** 历史重名索引清理：存在即删，不存在/语法不支持一律忽略（绝不影响主流程）。 */
