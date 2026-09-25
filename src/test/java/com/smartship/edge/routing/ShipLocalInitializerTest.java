@@ -71,4 +71,50 @@ class ShipLocalInitializerTest {
         assertDoesNotThrow(() -> ShipLocalInitializer.ensureReplayIdColumns(jt));
         assertEquals(0L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class));
     }
+
+    @Test
+    @DisplayName("真实异常必须抛（调用方置schemaReady=false，不带病启动）")
+    void realFailureThrows() {
+        JdbcTemplate jt = org.mockito.Mockito.mock(JdbcTemplate.class);
+        org.mockito.Mockito.doThrow(new RuntimeException("boom"))
+                .when(jt).execute(org.mockito.ArgumentMatchers.anyString());
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> ShipLocalInitializer.ensureReplayIdColumns(jt));
+    }
+
+    @Test
+    @DisplayName("历史长名重复索引被清理，只剩schema同名约束且功能生效")
+    void legacyDuplicateIndexCleaned() {
+        JdbcTemplate jt = oldShapeDb();
+        // 还原被旧版本污染的现场：列已在，但建了长名等价唯一索引
+        jt.execute("ALTER TABLE zncb_gps_data ADD COLUMN replay_id VARCHAR(64) NULL");
+        jt.execute("ALTER TABLE zncb_gps_data"
+                + " ADD CONSTRAINT uk_zncb_gps_data_replay_id UNIQUE (replay_id)");
+
+        ShipLocalInitializer.ensureReplayIdColumns(jt);
+
+        // 约束视图断言（H2 后台索引名会加后缀，不直接断言索引名）
+        java.util.List<String> constraints = jt.query(
+                "SELECT CONSTRAINT_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS"
+                        + " WHERE TABLE_NAME = 'ZNCB_GPS_DATA' AND CONSTRAINT_TYPE = 'UNIQUE'",
+                (rs, n) -> rs.getString(1));
+        assertTrue(constraints.contains("UK_GPS_REPLAY_ID"),
+                "必须有与schema同名的唯一约束，实际=" + constraints);
+        assertTrue(constraints.stream().noneMatch(c -> c.contains("ZNCB_GPS")),
+                "历史长名约束必须删掉，实际=" + constraints);
+
+        // 功能断言：重复 replay_id 被拒绝（这才是去重真正的保障）
+        jt.update("INSERT INTO zncb_gps_data (ship_id, mmsi, replay_id) VALUES (?,?,?)",
+                "S001", "413999999", "dup-1");
+        try {
+            jt.update("INSERT INTO zncb_gps_data (ship_id, mmsi, replay_id) VALUES (?,?,?)",
+                    "S001", "413999999", "dup-1");
+            assertTrue(false, "重复 replay_id 必须被拒绝");
+        } catch (Exception expected) {
+            // 唯一约束生效
+        }
+
+        // 清理后重复执行依然幂等
+        assertDoesNotThrow(() -> ShipLocalInitializer.ensureReplayIdColumns(jt));
+    }
 }
