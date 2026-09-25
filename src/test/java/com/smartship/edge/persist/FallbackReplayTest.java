@@ -1,6 +1,7 @@
 package com.smartship.edge.persist;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -333,6 +334,132 @@ class FallbackReplayTest {
                 "5000毒行之后正常行必须同轮回放");
         assertEquals(5000L, jt.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class),
                 "毒行保留供人工审计");
+    }
+
+    @Test
+    @DisplayName("P1：失败分级——确定性数据错误才记毒，未知一律按瞬时重试")
+    void failureClassification() {
+        // 确定性：积极信号才记毒
+        assertTrue(FallbackReplayer.isDeterministicFailure(
+                new org.springframework.dao.DataIntegrityViolationException("too long")));
+        assertTrue(FallbackReplayer.isDeterministicFailure(
+                new org.springframework.jdbc.BadSqlGrammarException(
+                        "t", "SELECT x", new java.sql.SQLException("table not found", "42S02"))));
+        assertTrue(FallbackReplayer.isDeterministicFailure(
+                new java.sql.SQLException("value too long", "22001")));
+        assertTrue(FallbackReplayer.isDeterministicFailure(
+                new java.sql.SQLException("null violation", "23502")));
+        assertTrue(FallbackReplayer.isDeterministicFailure(
+                new RuntimeException("wrap",
+                        new org.springframework.dao.DataIntegrityViolationException("c"))));
+
+        // 瞬时：未知一律按瞬时（宁可多重试，绝不错杀）
+        assertFalse(FallbackReplayer.isDeterministicFailure(new RuntimeException("boom")));
+        assertFalse(FallbackReplayer.isDeterministicFailure(
+                new java.sql.SQLException("Communications link failure", "08S01")));
+        assertFalse(FallbackReplayer.isDeterministicFailure(
+                new java.sql.SQLTransientConnectionException("Connection is not available")));
+        assertFalse(FallbackReplayer.isDeterministicFailure(
+                new RuntimeException(new java.sql.SQLTimeoutException(
+                        "Timeout trying to lock table", "HYT01", 40001))));
+        // 重复键已在上游吸收为成功，永不记毒
+        assertFalse(FallbackReplayer.isDeterministicFailure(
+                new org.springframework.dao.DuplicateKeyException("dup")));
+    }
+
+    @Test
+    @DisplayName("P1：确定性坏行记毒跳过，但同轮不堵住后面正常行")
+    void deterministicBadRowDoesNotStallQueue() {
+        JdbcTemplate jt = dbWithFallbackTable();
+        Object[] badArgs = gpsArgs();
+        badArgs[0] = "S".repeat(100); // ship_id VARCHAR(64)：超长必败，且每次必败
+        jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, replay_id, payload, error)"
+                        + " VALUES (?,?,?,?,?)",
+                "gps", "413999999", "bad-key-1",
+                com.smartship.edge.persist.FileFallbackStore.argsToJson(
+                        "gps", "413999999", "bad-key-1", badArgs),
+                "boom");
+        Object[] goodArgs = gpsArgs();
+        jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, replay_id, payload, error)"
+                        + " VALUES (?,?,?,?,?)",
+                "gps", "413999999", "good-key-1",
+                com.smartship.edge.persist.FileFallbackStore.argsToJson(
+                        "gps", "413999999", "good-key-1", goodArgs),
+                "boom");
+
+        EdgeProperties properties = new EdgeProperties();
+        FallbackReplayer replayer = new FallbackReplayer(jt, properties,
+                new FileFallbackStore(tempDir, 1024L, 4096L),
+                new SmartShipMetrics(new SimpleMeterRegistry()));
+
+        // 首轮：坏行记毒但不截断，正常行同轮回放（旧代码这里会 dbDown 截断，好行熬到第 6 轮才见天日）
+        replayer.replayDbTable(10);
+        assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class),
+                "确定性坏行不能堵住后面正常行");
+        assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class),
+                "坏行保留供人工审计");
+
+        // 多轮后依然稳定：坏行超限跳过，好行不受影响
+        for (int i = 0; i < FallbackReplayer.MAX_ROW_ATTEMPTS + 1; i++) {
+            replayer.replayDbTable(10);
+        }
+        assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class));
+        assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class),
+                "超限坏行保留供人工审计");
+    }
+
+    @Test
+    @DisplayName("P1：瞬时故障（锁等待超时）连败6轮不记毒，恢复后照常回放")
+    void transientFailuresNeverPoison() throws Exception {
+        JdbcTemplate jt = dbWithFallbackTable();
+        Object[] args = gpsArgs();
+        jt.update("INSERT INTO zncb_failed_writes (stream, mmsi, replay_id, payload, error)"
+                        + " VALUES (?,?,?,?,?)",
+                "gps", "413999999", "transient-key-1",
+                com.smartship.edge.persist.FileFallbackStore.argsToJson(
+                        "gps", "413999999", "transient-key-1", args),
+                "boom");
+
+        EdgeProperties properties = new EdgeProperties();
+        FallbackReplayer replayer = new FallbackReplayer(jt, properties,
+                new FileFallbackStore(tempDir, 1024L, 4096L),
+                new SmartShipMetrics(new SimpleMeterRegistry()));
+
+        // 占锁：另一连接预插入同 replay_id 未提交 → 回放 INSERT 被锁住直到超时（真瞬时故障）
+        java.sql.Connection locker = jt.getDataSource().getConnection();
+        locker.setAutoCommit(false);
+        try {
+            try (java.sql.PreparedStatement ps = locker.prepareStatement(
+                    "INSERT INTO zncb_gps_data (ship_id, mmsi, sentence_type, source,"
+                            + " timestamp, latitude, longitude, speed_knots, course_over_ground,"
+                            + " heading_true, heading_magnetic, magnetic_variation, altitude_m,"
+                            + " satellites, hdop, position_quality, gps_status, replay_id)"
+                            + " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")) {
+                Object[] full = java.util.Arrays.copyOf(args, args.length + 1);
+                full[args.length] = "transient-key-1";
+                for (int i = 0; i < full.length; i++) {
+                    ps.setObject(i + 1, full[i]);
+                }
+                ps.executeUpdate();
+            }
+            // 6 轮（> MAX_ROW_ATTEMPTS）：旧代码会把合法行熬成毒行永久跳过
+            for (int i = 0; i < FallbackReplayer.MAX_ROW_ATTEMPTS + 1; i++) {
+                replayer.replayDbTable(10);
+            }
+            assertEquals(1L,
+                    jt.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class),
+                    "瞬时故障再多轮也不能把合法行熬成毒行");
+            locker.rollback();
+        } finally {
+            locker.close();
+        }
+
+        // 锁释放（DB 恢复）后照常回放：旧代码下这行已被永久跳过，这里会失败
+        replayer.replayDbTable(10);
+        assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class),
+                "恢复后合法行必须照常回放");
+        assertEquals(0L, jt.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class),
+                "回放成功必须删行");
     }
 
     @Test

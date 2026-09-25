@@ -1,0 +1,127 @@
+name: ci
+
+# Edge 侧门禁（与岸端 Shore CI 互补）：
+#   1. edge-tests      —— 本仓全量单测，Edge 自己的 push/PR 直接验证；
+#   2. cross-repo-e2e  —— 用 *本次提交* 的 Edge 构建去跑岸端跨仓协议 E2E
+#      (EdgeProtocolE2ETest)，保证 replay_id / fallback / 迁移等改动在合入时
+#      就被真实边岸链路验证，而不是等到下一次 Shore 侧 CI 才发现。
+# Shore 侧 CI 只在 Shore push/PR 时触发，且 checkout 的是 Edge main，
+# 因此 Edge 侧必须有自己的触发器：这就是本 workflow 存在的理由。
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  edge-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      # 冷缓存可能撞上 Maven Central 限流 (HTTP 429)，属于瞬时基建抖动，
+      # 最多重试 3 次；真正失败的构建/测试每次都失败，不会被掩盖。
+      - name: Run full Edge test suite
+        run: |
+          for attempt in 1 2 3; do
+            if mvn -B clean test; then
+              break
+            fi
+            echo "mvn clean test attempt $attempt failed"
+            if [ "$attempt" = 3 ]; then
+              exit 1
+            fi
+            sleep $((attempt * 60))
+          done
+
+      - name: Summarize test results
+        if: always()
+        run: |
+          shopt -s nullglob
+          files=(target/surefire-reports/*.txt)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "FAIL: no surefire reports found (compile failure?)"
+            exit 1
+          fi
+          echo "=== Surefire per-class summary ==="
+          grep -h "Tests run" "${files[@]}"
+          echo "=== Totals ==="
+          TOTALS=$(grep -h "Tests run" "${files[@]}" \
+            | awk -F'[:,]' '{r+=$2; f+=$4; e+=$6; s+=$8} END {print r+0, f+0, e+0, s+0}')
+          echo "tests run / failures / errors / skipped: $TOTALS"
+          set -- $TOTALS
+          if [ "$2" != "0" ] || [ "$3" != "0" ]; then
+            echo "FAIL: failures or errors detected"
+            exit 1
+          fi
+          echo "Edge unit tests green with 0 failures / 0 errors."
+
+  cross-repo-e2e:
+    needs: edge-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Edge (this commit is already at job root)
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      # 注意：安装的是本次提交的 Edge，而不是 Edge main —— 跨仓 E2E
+      # 验证的正是即将合入的代码。Shore 侧 CI 用的是 Edge main，两边互补。
+      # 版本耦合：Shore pom 以 test-scope 依赖 smartship-edge-core 固定版本，
+      # 发版 bump Edge 版本号时须同步 Shore pom，否则这里 install 的版本对不上。
+      - name: Install Edge artifact (this commit, skip its tests)
+        run: mvn -B install -DskipTests
+
+      - name: Checkout Shore repo (main)
+        uses: actions/checkout@v4
+        with:
+          repository: Thehe01/Smartship-Shore
+          ref: main
+          path: .shore-checkout
+
+      # GitHub-hosted runners ship Docker, so the Testcontainers-backed
+      # EdgeProtocolE2ETest (Mosquitto / Kafka / MySQL) runs for real here.
+      - name: Run cross-repo protocol E2E on Shore side
+        run: |
+          for attempt in 1 2 3; do
+            if mvn -B -f .shore-checkout/pom.xml test -Dtest=EdgeProtocolE2ETest; then
+              break
+            fi
+            echo "EdgeProtocolE2ETest attempt $attempt failed"
+            if [ "$attempt" = 3 ]; then
+              exit 1
+            fi
+            sleep $((attempt * 60))
+          done
+
+      - name: Assert E2E really executed
+        if: always()
+        run: |
+          f=$(ls .shore-checkout/target/surefire-reports/*EdgeProtocolE2ETest.txt 2>/dev/null || true)
+          if [ -z "$f" ]; then
+            echo "FAIL: no surefire report for EdgeProtocolE2ETest"
+            exit 1
+          fi
+          line=$(grep "Tests run" "$f")
+          echo "EdgeProtocolE2ETest: $line"
+          case "$line" in
+            *"Failures: 0"*", Errors: 0"*", Skipped: 0"*) ;;
+            *) echo "FAIL: cross-repo E2E did not pass cleanly"; exit 1;;
+          esac
+          echo "Cross-repo protocol E2E green: Edge(this commit) <-> Shore(main)."

@@ -26,9 +26,15 @@ import org.springframework.stereotype.Service;
  *   下游 at-least-once + 岸端幂等吸收）。</li>
  * </ul>
  *
- * <p>毒行：解析失败/未知流按 id 记次，超 {@code MAX_ROW_ATTEMPTS} 后跳过保留
- * （行保留供人工审计）；DB 分页用 {@code id > cursor} 游标，毒行再多也不饿死
- * 后面的正常行。
+ * <p>失败分级（绝不错杀正常数据）：
+ * <ul>
+ *   <li>解析失败 / 未知流 / 确定性数据错误（违反约束、超长、坏语法等）→ 毒行记次，
+ *   超 {@code MAX_ROW_ATTEMPTS} 后跳过保留（行保留供人工审计），游标继续推进，
+ *   永不饿死后面的正常行；</li>
+ *   <li>瞬时故障（拿不到连接、连接异常、锁等待超时、死锁等）→ <b>不计数</b>，
+ *   本轮即停、下轮原样重试。MySQL 长时间故障也不会把合法数据熬成毒行。</li>
+ * </ul>
+ * 未知异常一律按瞬时处理：宁可多重试一轮，绝不错杀。
  */
 @Slf4j
 @Service
@@ -73,8 +79,8 @@ public class FallbackReplayer {
 
     /**
      * 回放 DB 兜底表（id 游标分页，固定小页）。表不存在（如极老库）直接跳过；
-     * 首个回放失败即停（DB 可能仍不可用），毒行跳过继续——游标按 id 单调推进，
-     * 毒行再多也不饿死后面的正常行；毒行与预算无关，只成功回放才消耗 budget。
+     * 瞬时 DB 故障即停（下轮原样重试，不记毒）；确定性坏行记次，超限跳过继续——
+     * 游标按 id 单调推进，毒行再多也不饿死后面的正常行；只有成功回放才消耗 budget。
      */
     int replayDbTable(int budget) {
         int replayed = 0;
@@ -127,13 +133,20 @@ public class FallbackReplayer {
                 }
                 // 幂等键以兜底表列为准（写入时与 payload 同值），老诊断行列为空才退到 JSON。
                 String rid = hasText(row.replayId()) ? row.replayId() : parsed.replayId();
-                if (replayDbRow(row, parsed, rid)) {
+                RowOutcome outcome = replayDbRow(row, parsed, rid);
+                if (outcome == RowOutcome.OK) {
                     rowAttempts.remove(key);
                     replayed++;
-                } else {
-                    noteAttempt(key);
+                } else if (outcome == RowOutcome.TRANSIENT_FAIL) {
+                    // 瞬时故障：不记毒，本轮即停，下轮原样重试。
                     dbDown = true;
                     break;
+                } else {
+                    // 确定性坏行：记毒，超限后跳过保留；DB 既然可用就继续扫后面的行。
+                    if (noteAttempt(key)) {
+                        log.warn("[Fallback-Replay] 兜底表坏行跳过保留 (id={}, stream={})",
+                                row.id(), parsed.stream());
+                    }
                 }
             }
         }
@@ -147,8 +160,10 @@ public class FallbackReplayer {
      * 单行 DB 回放：INSERT 主表 + DELETE 兜底行同一本地事务原子提交。
      * <p>崩溃要么全有要么全无——消灭“写完主表、没删兜底行”导致的重复窗口
      * （重复行的自增 id 不同会导致岸端 msg_id 不同而无法去重）。
+     * <p>返回值区分瞬时故障与确定性坏行：前者调用方不记毒（下轮重试），
+     * 后者调用方记毒（超限跳过，避免一坏行永久堵住队列）。
      */
-    private boolean replayDbRow(
+    private RowOutcome replayDbRow(
             DbRow row, FileFallbackStore.ParsedLine parsed, String replayId) {
         String sql = NmeaDataPersistenceService.sqlForStream(parsed.stream());
         Object[] jdbcArgs = withReplayId(parsed, replayId);
@@ -159,7 +174,7 @@ public class FallbackReplayer {
             }
             log.warn("[Fallback-Replay] 无 DataSource，保留现场下轮重试: stream={}",
                     parsed.stream());
-            return false;
+            return RowOutcome.TRANSIENT_FAIL;
         }
         try (java.sql.Connection con = ds.getConnection()) {
             con.setAutoCommit(false);
@@ -180,15 +195,20 @@ public class FallbackReplayer {
                 if (metrics != null) {
                     metrics.recordFallbackReplay(true);
                 }
-                return true;
+                return RowOutcome.OK;
             } catch (Exception e) {
                 rollbackQuietly(con);
                 if (metrics != null) {
                     metrics.recordFallbackReplay(false);
                 }
-                log.warn("[Fallback-Replay] 回放失败保留现场: stream={}, err={}",
+                if (isDeterministicFailure(e)) {
+                    log.warn("[Fallback-Replay] 坏行保留现场（记毒）: stream={}, err={}",
+                            parsed.stream(), e.getMessage());
+                    return RowOutcome.DATA_FAIL;
+                }
+                log.warn("[Fallback-Replay] 瞬时故障保留现场（不记毒，下轮重试）: stream={}, err={}",
                         parsed.stream(), e.getMessage());
-                return false;
+                return RowOutcome.TRANSIENT_FAIL;
             }
         } catch (Exception e) {
             if (metrics != null) {
@@ -196,8 +216,47 @@ public class FallbackReplayer {
             }
             log.warn("[Fallback-Replay] 回放连接失败保留现场: stream={}, err={}",
                     parsed.stream(), e.getMessage());
-            return false;
+            return RowOutcome.TRANSIENT_FAIL;
         }
+    }
+
+    /** 单行回放结果。 */
+    private enum RowOutcome {
+        OK,
+        TRANSIENT_FAIL,
+        DATA_FAIL
+    }
+
+    /**
+     * 确定性数据错误（行本身坏，重试无用）→ 调用方可记毒；
+     * 其余一律按瞬时故障处理（宁可多重试一轮，绝不错杀正常数据）。
+     * <p>判定只认两类积极信号：Spring 的数据错误异常族、
+     * SQLState 数据异常（22）/完整性约束（23）。{@code DuplicateKeyException}
+     * 明确不算（调用方在更早位置已吸收为成功）。
+     */
+    static boolean isDeterministicFailure(Throwable t) {
+        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
+            if (cur instanceof org.springframework.dao.DuplicateKeyException) {
+                return false;
+            }
+            if (cur instanceof org.springframework.dao.DataIntegrityViolationException
+                    || cur instanceof org.springframework.jdbc.BadSqlGrammarException
+                    || cur instanceof
+                    org.springframework.dao.InvalidDataAccessResourceUsageException
+                    || cur instanceof org.springframework.dao.TypeMismatchDataAccessException) {
+                return true;
+            }
+            if (cur instanceof java.sql.SQLException se) {
+                String state = se.getSQLState();
+                if (state != null && (state.startsWith("22") || state.startsWith("23"))) {
+                    return true;
+                }
+            }
+            if (cur.getCause() == cur) {
+                break;
+            }
+        }
+        return false;
     }
 
     private static void rollbackQuietly(java.sql.Connection con) {
