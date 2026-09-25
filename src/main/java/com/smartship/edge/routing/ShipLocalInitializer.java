@@ -284,14 +284,16 @@ public class ShipLocalInitializer {
     }
 
     /**
-     * Best-effort 清理落在 {@code replay_id} 上的非规范名唯一索引（历史长名等），
-     * 避免同列双 UNIQUE。找不到/删不掉一律忽略，不影响主流程。
+     * Best-effort 清理列集合恰好只有 {@code replay_id} 的非规范名单列唯一索引
+     * （历史长名等），避免同列双 UNIQUE。复合唯一索引（如未来可能出现的
+     * {@code (replay_id, other_col)}）一律保留。找不到/删不掉一律忽略，
+     * 不影响主流程。
      */
     private static void cleanupNonCanonicalUnique(JdbcTemplate jt, String table, String canonical) {
         try {
             java.util.List<String> extras = jt.execute(
                     (org.springframework.jdbc.core.ConnectionCallback<java.util.List<String>>) con -> {
-                        java.util.Map<String, java.util.List<String>> colsByIndex =
+                        java.util.Map<String, java.util.Set<String>> colsByIndex =
                                 new java.util.LinkedHashMap<>();
                         for (String tPattern : new String[]{table, table.toUpperCase(
                                 java.util.Locale.ROOT)}) {
@@ -313,23 +315,26 @@ public class ShipLocalInitializer {
                                         continue;
                                     }
                                     colsByIndex.computeIfAbsent(idx,
-                                            k -> new java.util.ArrayList<>()).add(col);
+                                            k -> new java.util.LinkedHashSet<>()).add(
+                                            col.toLowerCase(java.util.Locale.ROOT));
                                 }
                             } catch (Exception ignored) {
                                 // 换下一种表名大小写再试
                             }
                         }
                         java.util.List<String> out = new java.util.ArrayList<>();
-                        for (java.util.Map.Entry<String, java.util.List<String>> en
+                        for (java.util.Map.Entry<String, java.util.Set<String>> en
                                 : colsByIndex.entrySet()) {
                             if (en.getKey().equalsIgnoreCase(canonical)) {
                                 continue;
                             }
-                            for (String c : en.getValue()) {
-                                if (c.equalsIgnoreCase("replay_id")) {
-                                    out.add(en.getKey());
-                                    break;
-                                }
+                            // 仅清理“列集合恰好只有 replay_id”的单列唯一索引；
+                            // 复合唯一索引（如 (replay_id, other_col)）必须保留。
+                            // 用去重后的小写列集合判断：同一索引在两种表名大小写下
+                            // 各返回一行时不会被误判成多列。
+                            java.util.Set<String> cols = en.getValue();
+                            if (cols.size() == 1 && cols.contains("replay_id")) {
+                                out.add(en.getKey());
                             }
                         }
                         return out;

@@ -141,4 +141,24 @@ class ShipLocalInitializerTest {
         assertTrue(constraints.stream().noneMatch(c -> c.equalsIgnoreCase("UK_GPS_REPLAY_ID")),
                 "约束没建成才是失败的证据，实际=" + constraints);
     }
+
+    @Test
+    @DisplayName("复合唯一索引(replay_id,other_col)不被清理，规范单列约束照常补上")
+    void compositeUniquePreserved() {
+        JdbcTemplate jt = oldShapeDb();
+        jt.execute("ALTER TABLE zncb_gps_data ADD COLUMN replay_id VARCHAR(64) NULL");
+        jt.execute("ALTER TABLE zncb_gps_data"
+                + " ADD CONSTRAINT uk_gps_composite UNIQUE (replay_id, ship_id)");
+
+        ShipLocalInitializer.ensureReplayIdColumns(jt);
+
+        java.util.List<String> constraints = jt.query(
+                "SELECT CONSTRAINT_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS"
+                        + " WHERE TABLE_NAME = 'ZNCB_GPS_DATA' AND CONSTRAINT_TYPE = 'UNIQUE'",
+                (rs, n) -> rs.getString(1));
+        assertTrue(constraints.stream().anyMatch(c -> c.equalsIgnoreCase("UK_GPS_COMPOSITE")),
+                "复合唯一索引必须保留，实际=" + constraints);
+        assertTrue(constraints.stream().anyMatch(c -> c.equalsIgnoreCase("UK_GPS_REPLAY_ID")),
+                "规范单列约束仍需补上，实际=" + constraints);
+    }
 }
