@@ -6,7 +6,7 @@ import io.micrometer.core.instrument.binder.MeterBinder;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.jdbc.BadSqlGrammarException;
-import org.springframework.jdbc.core.JdbcTemplate;
+import com.smartship.edge.persistence.EdgeTelemetryRepository;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
@@ -32,7 +32,7 @@ public class UploadBacklogMetrics implements MeterBinder {
             "zncb_engine_data"
     );
 
-    private final JdbcTemplate jdbcTemplate;
+    private final EdgeTelemetryRepository repository;
     private final AtomicLong lastKnownBacklog = new AtomicLong(0L);
 
     @Override
@@ -50,7 +50,7 @@ public class UploadBacklogMetrics implements MeterBinder {
         try {
             long sampledBacklog = 0L;
             for (String table : TELEMETRY_TABLES) {
-                sampledBacklog += calculateTableBacklog(jdbcTemplate, table);
+                sampledBacklog += calculateTableBacklog(repository, table);
             }
             lastKnownBacklog.set(sampledBacklog);
         } catch (Exception e) {
@@ -58,9 +58,9 @@ public class UploadBacklogMetrics implements MeterBinder {
         }
     }
 
-    private long calculateTableBacklog(JdbcTemplate jt, String table) {
+    private long calculateTableBacklog(EdgeTelemetryRepository jt, String table) {
         try {
-            Long maxId = jt.queryForObject("SELECT COALESCE(MAX(id), 0) FROM " + table, Long.class);
+            Long maxId = jt.maxId(table);
             if (maxId == null || maxId <= 0) {
                 return 0L;
             }
@@ -73,14 +73,9 @@ public class UploadBacklogMetrics implements MeterBinder {
         }
     }
 
-    private long queryCursorId(JdbcTemplate jt, String table) {
+    private long queryCursorId(EdgeTelemetryRepository jt, String table) {
         try {
-            List<Long> results = jt.query(
-                    "SELECT last_uploaded_id FROM zncb_upload_cursor WHERE stream_name = ? AND partition_key = ''",
-                    (rs, rowNum) -> rs.getLong(1),
-                    table
-            );
-            return results.isEmpty() ? 0L : results.get(0);
+            return jt.cursor(table);
         } catch (BadSqlGrammarException e) {
             // 游标表尚未初始化/不存在，视为从未上传（游标为 0）
             return 0L;

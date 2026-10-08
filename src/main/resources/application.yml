@@ -89,3 +89,7 @@ smartship:
         auto-reconnect: true
         keep-alive-interval: 60
         connection-timeout: 10
+
+mybatis:
+  configuration:
+    call-setters-on-nulls: true

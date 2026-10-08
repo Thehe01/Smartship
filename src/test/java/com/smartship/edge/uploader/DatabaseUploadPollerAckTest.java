@@ -1,5 +1,7 @@
 package com.smartship.edge.uploader;
 
+import com.smartship.edge.persistence.MyBatisTestSupport;
+import com.smartship.edge.persistence.EdgeTelemetryRepository;
 import com.smartship.edge.config.EdgeProperties;
 import com.smartship.edge.uploader.mqtt.MqttPublisher;
 import org.junit.jupiter.api.AfterEach;
@@ -67,7 +69,7 @@ class DatabaseUploadPollerAckTest {
         when(publisher.getClientManager())
                 .thenReturn(mock(com.smartship.edge.uploader.mqtt.MqttClientManager.class));
         tracker = new UploadAckTracker();
-        poller = new DatabaseUploadPoller(properties, jdbc,
+        poller = new DatabaseUploadPoller(properties, MyBatisTestSupport.repository(jdbc),
                 publisher, null, null, tracker);
         ship = new DatabaseUploadPoller.LocalShip("S001", MMSI);
     }
@@ -108,13 +110,13 @@ class DatabaseUploadPollerAckTest {
     void pubackDoesNotAdvanceCursor() {
         insertRows(1001, 1002, 1003);
 
-        poller.uploadIncrementalStream(jdbc, ship, stream());
+        poller.uploadIncrementalStream(MyBatisTestSupport.repository(jdbc), ship, stream());
         assertEquals(3, publishedRows().size(), "三行全部发出");
         assertEquals(0L, cursor(), "PUBACK 不推进游标，等 Application ACK");
         assertEquals(3, tracker.inFlightCount(MMSI, TABLE));
 
         clearInvocations(publisher);
-        poller.uploadIncrementalStream(jdbc, ship, stream());
+        poller.uploadIncrementalStream(MyBatisTestSupport.repository(jdbc), ship, stream());
         verify(publisher, never()).publish(anyString(), anyString(), anyString(), anyMap());
         assertEquals(0L, cursor(), "无 ACK 时游标冻结，主循环不重复发已在途行");
     }
@@ -124,7 +126,7 @@ class DatabaseUploadPollerAckTest {
     void acksAdvanceWatermark() {
         insertRows(1001, 1002);
 
-        poller.uploadIncrementalStream(jdbc, ship, stream());
+        poller.uploadIncrementalStream(MyBatisTestSupport.repository(jdbc), ship, stream());
 
         // 跟踪器登记的 msg_id 必须等于发布载荷里的 msg_id（同纯函数同行，双重保险）。
         for (Map<String, Object> row : publishedRows()) {
@@ -134,7 +136,7 @@ class DatabaseUploadPollerAckTest {
             assertTrue(tracker.onAck(MMSI, payloadMsgId, String.valueOf(id)));
         }
 
-        poller.uploadIncrementalStream(jdbc, ship, stream());
+        poller.uploadIncrementalStream(MyBatisTestSupport.repository(jdbc), ship, stream());
         assertEquals(1002L, cursor(), "连续 ACK watermark 推进游标");
     }
 
@@ -142,22 +144,22 @@ class DatabaseUploadPollerAckTest {
     @DisplayName("T5: 重启后未 ACK 行继续补传，已推进的不再重发")
     void restartResumesUnacked() {
         insertRows(1001, 1002);
-        poller.uploadIncrementalStream(jdbc, ship, stream());
+        poller.uploadIncrementalStream(MyBatisTestSupport.repository(jdbc), ship, stream());
         for (Map<String, Object> row : publishedRows()) {
             tracker.onAck(MMSI, MqttPublisher.stableMessageId(MMSI, "nmea_gps", row),
                     String.valueOf(row.get("id")));
         }
-        poller.uploadIncrementalStream(jdbc, ship, stream());
+        poller.uploadIncrementalStream(MyBatisTestSupport.repository(jdbc), ship, stream());
         assertEquals(1002L, cursor());
 
         // 重启 = 新跟踪器 + 新 poller，游标表持久化了，H2 同库。
         UploadAckTracker freshTracker = new UploadAckTracker();
         DatabaseUploadPoller freshPoller = new DatabaseUploadPoller(properties,
-                jdbc, publisher, null, null, freshTracker);
+                MyBatisTestSupport.repository(jdbc), publisher, null, null, freshTracker);
         insertRows(1003);
         clearInvocations(publisher);
 
-        freshPoller.uploadIncrementalStream(jdbc, ship, freshPollerStream());
+        freshPoller.uploadIncrementalStream(MyBatisTestSupport.repository(jdbc), ship, freshPollerStream());
         List<Map<String, Object>> resent = publishedRows();
         assertEquals(1, resent.size(), "只补传游标之后的行");
         assertEquals(1003L, ((Number) resent.get(0).get("id")).longValue());
@@ -165,7 +167,7 @@ class DatabaseUploadPollerAckTest {
 
         freshTracker.onAck(MMSI,
                 MqttPublisher.stableMessageId(MMSI, "nmea_gps", resent.get(0)), "1003");
-        freshPoller.uploadIncrementalStream(jdbc, ship, freshPollerStream());
+        freshPoller.uploadIncrementalStream(MyBatisTestSupport.repository(jdbc), ship, freshPollerStream());
         assertEquals(1003L, cursor(), "补传 ACK 后游标跟上");
     }
 
@@ -179,7 +181,7 @@ class DatabaseUploadPollerAckTest {
         properties.getUploader().getAck().setEnabled(false);
         insertRows(1001, 1002);
 
-        poller.uploadIncrementalStream(jdbc, ship, stream());
+        poller.uploadIncrementalStream(MyBatisTestSupport.repository(jdbc), ship, stream());
 
         assertEquals(2, publishedRows().size());
         assertEquals(1002L, cursor(), "旧语义：PUBACK 即推进");
@@ -192,7 +194,7 @@ class DatabaseUploadPollerAckTest {
         properties.getUploader().getAck().setAckTimeoutMs(0L);
         insertRows(1001, 1002);
 
-        poller.uploadIncrementalStream(jdbc, ship, stream());
+        poller.uploadIncrementalStream(MyBatisTestSupport.repository(jdbc), ship, stream());
 
         // 首轮 2 发 + 补发轮（限 batchSize=10）：补发被触发，无异常、无游标推进。
         assertTrue(publishedRows().size() >= 2, "补发路径被执行");
@@ -216,7 +218,7 @@ class DatabaseUploadPollerAckTest {
                     return true;
                 });
 
-        poller.uploadIncrementalStream(jdbc, ship, stream());
+        poller.uploadIncrementalStream(MyBatisTestSupport.repository(jdbc), ship, stream());
 
         assertEquals(1002L, cursor(), "PUBACK 返回前的 ACK 必须 counted，游标一次推进");
     }
@@ -228,7 +230,7 @@ class DatabaseUploadPollerAckTest {
         when(publisher.publish(anyString(), anyString(), anyString(), anyMap()))
                 .thenReturn(false);
 
-        poller.uploadIncrementalStream(jdbc, ship, stream());
+        poller.uploadIncrementalStream(MyBatisTestSupport.repository(jdbc), ship, stream());
 
         assertFalse(tracker.isTracked(MMSI, TABLE, 1001L), "预注册必须回滚");
         assertEquals(0, tracker.inFlightCount(MMSI, TABLE));
@@ -237,13 +239,13 @@ class DatabaseUploadPollerAckTest {
         // 恢复后重试：登记-确认-推进全链路正常。
         when(publisher.publish(anyString(), anyString(), anyString(), anyMap()))
                 .thenReturn(true);
-        poller.uploadIncrementalStream(jdbc, ship, stream());
+        poller.uploadIncrementalStream(MyBatisTestSupport.repository(jdbc), ship, stream());
         assertTrue(tracker.isTracked(MMSI, TABLE, 1001L));
         assertEquals(0L, cursor(), "ACK 到达前游标仍不动");
 
         Map<String, Object> row = publishedRows().get(publishedRows().size() - 1);
         tracker.onAck(MMSI, MqttPublisher.stableMessageId(MMSI, "nmea_gps", row), "1001");
-        poller.uploadIncrementalStream(jdbc, ship, stream());
+        poller.uploadIncrementalStream(MyBatisTestSupport.repository(jdbc), ship, stream());
         assertEquals(1001L, cursor(), "重试成功 + ACK 后游标推进");
     }
 }

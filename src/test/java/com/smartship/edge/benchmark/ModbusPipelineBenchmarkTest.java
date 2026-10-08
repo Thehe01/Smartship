@@ -1,5 +1,7 @@
 package com.smartship.edge.benchmark;
 
+import com.smartship.edge.persistence.MyBatisTestSupport;
+import com.smartship.edge.persistence.EdgeTelemetryRepository;
 import com.smartship.edge.benchmark.simulator.ModbusSimulationConfig;
 import com.smartship.edge.benchmark.simulator.ModbusTcpDeviceSimulator;
 import com.smartship.edge.benchmark.support.BenchmarkFixtures;
@@ -85,7 +87,7 @@ class ModbusPipelineBenchmarkTest {
             properties.getCollect().getPersist().setMinWriteIntervalSeconds(0);
 
             NmeaDataPersistenceService realPersist =
-                    new NmeaDataPersistenceService(jt, properties, new PersistenceThrottle(properties));
+                    new NmeaDataPersistenceService(MyBatisTestSupport.repository(jt), properties, new PersistenceThrottle(properties));
             persistSpy = spy(realPersist);
             ModbusDataHandler handler = new ModbusDataHandler(
                     persistSpy, properties, new PersistenceThrottle(properties));

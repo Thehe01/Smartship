@@ -1,5 +1,7 @@
 package com.smartship.edge.routing.service;
 
+import com.smartship.edge.persistence.MyBatisTestSupport;
+import com.smartship.edge.persistence.EdgeTelemetryRepository;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -53,160 +55,97 @@ class PersistenceFallbackTest {
     @Test
     @DisplayName("瞬态失败一次：重试成功，不计失败不进兜底")
     void transientFailureRecoveredByRetry() {
-        JdbcTemplate jt = mock(JdbcTemplate.class);
-        when(jt.update(anyString(), any(Object[].class)))
-                .thenThrow(new RuntimeException("glitch"))
-                .thenReturn(1);
-
-        NmeaDataPersistenceService service =
-                new NmeaDataPersistenceService(jt, properties, null, metrics);
-        service.saveGps("RMC", "SERIAL", 31.2, 121.5, 12.0, 180.0,
-                180.0, 180.0, 0.0, 10.0, 8, 1.0, 1, "A", "413999999");
-
+        EdgeTelemetryRepository repository = mock(EdgeTelemetryRepository.class);
+        when(repository.insert(anyString(), any(Object[].class)))
+                .thenThrow(new RuntimeException("glitch")).thenReturn(1);
+        NmeaDataPersistenceService service = new NmeaDataPersistenceService(repository, properties, null, metrics);
+        saveGps(service);
         assertEquals(1.0, counter("smartship_persistence_writes_total",
                 "type", "gps", "result", "success").count());
-        assertEquals(0, registry.find("smartship_persistence_writes_total")
-                .tags("type", "gps", "result", "failure").counters().size()
-                + registry.find("smartship_persistence_fallback_total").counters().size(),
-                "重试成功不得产生失败/兜底计数");
+        org.mockito.Mockito.verify(repository, org.mockito.Mockito.never()).insertFallback(any());
+        assertTrue(registry.find("smartship_persistence_fallback_total").counters().isEmpty());
     }
 
     @Test
-    @DisplayName("持续失败：主表两次+兜底一次，失败与兜底各计一次")
+    @DisplayName("持续失败：主表两次后兜底，原参数和replay_id完整保留")
     void persistentFailureGoesToFallback() {
-        JdbcTemplate jt = mock(JdbcTemplate.class);
-        when(jt.update(anyString(), any(Object[].class)))
-                .thenThrow(new RuntimeException("DB down"))
-                .thenThrow(new RuntimeException("DB down"))
-                .thenReturn(1);
-
-        NmeaDataPersistenceService service =
-                new NmeaDataPersistenceService(jt, properties, null, metrics);
+        EdgeTelemetryRepository repository = mock(EdgeTelemetryRepository.class);
+        when(repository.insert(anyString(), any(Object[].class))).thenThrow(new RuntimeException("DB down"));
+        when(repository.insertFallback(any(Object[].class))).thenReturn(1);
+        NmeaDataPersistenceService service = new NmeaDataPersistenceService(repository, properties, null, metrics);
         service.saveWind("MWV", "SERIAL", 10.0, 5.0, 20.0, 21.0, 6.0, "413999999");
-
-        verify(jt, times(3)).update(anyString(), any(Object[].class));
-        assertEquals(1.0, counter("smartship_persistence_writes_total",
-                "type", "wind", "result", "failure").count());
-        assertEquals(1.0, counter("smartship_persistence_fallback_total",
-                "type", "wind").count());
-
-        // 第三次调用是兜底表插入：payload 必须是可回放 JSON（与回放器同一编解码）。
-        org.mockito.ArgumentCaptor<String> sqlCaptor =
-                org.mockito.ArgumentCaptor.forClass(String.class);
-        org.mockito.ArgumentCaptor<Object[]> argsCaptor =
-                org.mockito.ArgumentCaptor.forClass(Object[].class);
-        verify(jt, times(3)).update(sqlCaptor.capture(), argsCaptor.capture());
-        Object[] fallbackArgs = argsCaptor.getAllValues().get(2);
+        verify(repository, times(2)).insert(anyString(), any(Object[].class));
+        var captor = org.mockito.ArgumentCaptor.forClass(Object[].class);
+        verify(repository).insertFallback(captor.capture());
+        Object[] fallbackArgs = captor.getValue();
         assertEquals("wind", fallbackArgs[0]);
-        assertTrue(fallbackArgs[2] != null && !String.valueOf(fallbackArgs[2]).isBlank(),
-                "兜底行必须携带统一 replay_id");
-        com.smartship.edge.persist.FileFallbackStore.ParsedLine parsed =
-                com.smartship.edge.persist.FileFallbackStore.parseLine((String) fallbackArgs[3]);
+        assertTrue(fallbackArgs[2] instanceof String id && !id.isBlank());
+        var parsed = com.smartship.edge.persist.FileFallbackStore.parseLine((String) fallbackArgs[3]);
         assertEquals("wind", parsed.stream());
         assertEquals("413999999", parsed.mmsi());
-        assertEquals(10, parsed.args().size(), "wind 行 10 个参数必须完整可回放");
+        assertEquals(fallbackArgs[2], parsed.replayId());
+        assertEquals(10, parsed.args().size());
+        assertEquals(1.0, counter("smartship_persistence_writes_total", "type", "wind", "result", "failure").count());
+        assertEquals(1.0, counter("smartship_persistence_fallback_total", "type", "wind").count());
     }
 
     @Test
-    @DisplayName("真库兜底行可查：持续失败后 failed_writes 落一笔")
+    @DisplayName("真库兜底行可查：主表缺列后failed_writes精确落一笔")
     void fallbackRowLandsInRealTable() {
-        DriverManagerDataSource ds = new DriverManagerDataSource(
-                "jdbc:h2:mem:fallback_test_" + System.nanoTime() + ";DB_CLOSE_DELAY=-1;MODE=MySQL",
-                "sa", "");
-        JdbcTemplate jt = new JdbcTemplate(ds);
-        jt.execute("CREATE TABLE zncb_depth_data (id BIGINT AUTO_INCREMENT PRIMARY KEY,"
-                + " ship_id VARCHAR(64), mmsi VARCHAR(32), replay_id VARCHAR(64) NULL)");
-        // 主表缺列（无 depth_m）→ 每次 update 必抛；兜底表正常 → 精确落一笔
-        jt.execute("CREATE TABLE zncb_failed_writes (id BIGINT AUTO_INCREMENT PRIMARY KEY,"
-                + " stream VARCHAR(32), mmsi VARCHAR(32), replay_id VARCHAR(64) NULL,"
-                + " payload TEXT, error VARCHAR(500))");
-
-        NmeaDataPersistenceService service =
-                new NmeaDataPersistenceService(jt, properties, null, metrics);
+        JdbcTemplate jdbc = h2("fallback_",
+                "CREATE TABLE zncb_depth_data (id BIGINT AUTO_INCREMENT PRIMARY KEY, ship_id VARCHAR(64), mmsi VARCHAR(32), replay_id VARCHAR(64))",
+                "CREATE TABLE zncb_failed_writes (id BIGINT AUTO_INCREMENT PRIMARY KEY, stream VARCHAR(32), mmsi VARCHAR(32), replay_id VARCHAR(64), payload TEXT, error VARCHAR(500))");
+        NmeaDataPersistenceService service = new NmeaDataPersistenceService(MyBatisTestSupport.repository(jdbc), properties, null, metrics);
         service.saveDepth("DPT", "SERIAL", 12.5, 0.5, "413999999");
-
-        Long n = jt.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class);
-        assertEquals(1L, n, "兜底表必须落一笔可回放行");
-        assertEquals(1.0, counter("smartship_persistence_fallback_total",
-                "type", "depth").count());
+        assertEquals(1L, jdbc.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class));
+        assertEquals(1.0, counter("smartship_persistence_fallback_total", "type", "depth").count());
     }
 
     @Test
-    @DisplayName("批量路径：连接都拿不到时整批进三级兜底，不静默丢失")
-    void batchFallbackWhenConnectionUnavailable() throws Exception {
-        JdbcTemplate jt = mock(JdbcTemplate.class);
-        javax.sql.DataSource ds = mock(javax.sql.DataSource.class);
-        when(jt.getDataSource()).thenReturn(ds);
-        when(ds.getConnection()).thenThrow(new java.sql.SQLException("MySQL down"));
-        when(jt.update(org.mockito.ArgumentMatchers.argThat(
-                (String sql) -> sql != null && sql.contains("zncb_failed_writes")),
-                any(Object[].class))).thenReturn(1);
-
-        com.smartship.edge.persist.FileFallbackStore store =
-                mock(com.smartship.edge.persist.FileFallbackStore.class);
-        NmeaDataPersistenceService service =
-                new NmeaDataPersistenceService(jt, properties, null, metrics, store);
-        java.util.List<EnginePoint> batch = java.util.List.of(
-                EnginePoint.now("413999999", 1, 1500.0, 85.0, 0.5, 0.4, 420.0, 0.25,
-                        2.8, 75.0, 24.5, 12000, 1, 0, 0),
-                EnginePoint.now("413999999", 2, 1500.0, 85.0, 0.5, 0.4, 420.0, 0.25,
-                        2.8, 75.0, 24.5, 12000, 1, 0, 0));
-
-        assertEquals(0, service.saveEngineBatch(batch), "主表无一行落库");
-        assertEquals(2.0, counter("smartship_persistence_fallback_total",
-                "type", "engine").count(), "两行必须全部进入兜底");
-        verify(jt, times(2)).update(
-                org.mockito.ArgumentMatchers.argThat(
-                        (String sql) -> sql != null && sql.contains("zncb_failed_writes")),
-                any(Object[].class));
+    @DisplayName("批量路径：DB连接故障后整批进入耐久兜底")
+    void batchFallbackWhenConnectionUnavailable() {
+        EdgeTelemetryRepository repository = mock(EdgeTelemetryRepository.class);
+        when(repository.insertEngineBatch(org.mockito.ArgumentMatchers.anyList()))
+                .thenThrow(new org.springframework.dao.DataAccessResourceFailureException("MySQL down"));
+        when(repository.insert(anyString(), any(Object[].class))).thenThrow(new RuntimeException("MySQL down"));
+        when(repository.insertFallback(any(Object[].class))).thenReturn(1);
+        var store = mock(com.smartship.edge.persist.FileFallbackStore.class);
+        var service = new NmeaDataPersistenceService(repository, properties, null, metrics, store);
+        assertEquals(0, service.saveEngineBatch(List.of(point(), point())));
+        verify(repository, times(2)).insertFallback(any(Object[].class));
+        assertEquals(2.0, counter("smartship_persistence_fallback_total", "type", "engine").count());
     }
 
     @Test
     @DisplayName("批量路径：逐行补写两次失败的行进三级兜底")
-    void batchRowFallbackAfterRetryExhausted() throws Exception {
-        JdbcTemplate jt = mock(JdbcTemplate.class);
-        javax.sql.DataSource ds = mock(javax.sql.DataSource.class);
-        when(jt.getDataSource()).thenReturn(ds);
-        java.sql.Connection con = mock(java.sql.Connection.class);
-        when(ds.getConnection()).thenReturn(con);
-        java.sql.PreparedStatement ps = mock(java.sql.PreparedStatement.class);
-        when(con.prepareStatement(anyString())).thenReturn(ps);
-        // 整批执行返回 EXECUTE_FAILED → 回滚 → 逐行补写
-        when(ps.executeBatch()).thenReturn(new int[]{java.sql.Statement.EXECUTE_FAILED});
-        // 逐行补写全部抛，兜底插入成功
-        when(jt.update(anyString(), any(Object[].class))).thenAnswer(inv -> {
-            String sql = inv.getArgument(0);
-            if (sql.contains("zncb_failed_writes")) {
-                return 1;
-            }
-            throw new RuntimeException("row down");
-        });
-
-        com.smartship.edge.persist.FileFallbackStore store =
-                mock(com.smartship.edge.persist.FileFallbackStore.class);
-        NmeaDataPersistenceService service =
-                new NmeaDataPersistenceService(jt, properties, null, metrics, store);
-        java.util.List<EnginePoint> batch = java.util.List.of(
-                EnginePoint.now("413999999", 1, 1500.0, 85.0, 0.5, 0.4, 420.0, 0.25,
-                        2.8, 75.0, 24.5, 12000, 1, 0, 0));
-
-        assertEquals(0, service.saveEngineBatch(batch));
-        assertEquals(1.0, counter("smartship_persistence_fallback_total",
-                "type", "engine").count(), "补写耗尽的行必须进兜底");
+    void batchRowFallbackAfterRetryExhausted() {
+        EdgeTelemetryRepository repository = mock(EdgeTelemetryRepository.class);
+        when(repository.insertEngineBatch(org.mockito.ArgumentMatchers.anyList())).thenThrow(new RuntimeException("batch down"));
+        when(repository.insert(anyString(), any(Object[].class))).thenThrow(new RuntimeException("row down"));
+        when(repository.insertFallback(any(Object[].class))).thenReturn(1);
+        var service = new NmeaDataPersistenceService(repository, properties, null, metrics,
+                mock(com.smartship.edge.persist.FileFallbackStore.class));
+        assertEquals(0, service.saveEngineBatch(List.of(point())));
+        verify(repository, times(2)).insert(anyString(), any(Object[].class));
+        verify(repository).insertFallback(any(Object[].class));
     }
 
     @Test
-    @DisplayName("基础SQL自带replay_id列：5流全覆盖（回放复用同一语句）")
-    void baseSqlCarriesReplayIdForAllStreams() {
-        for (String stream : new String[]{"gps", "wind", "depth", "rudder", "engine"}) {
-            String sql = NmeaDataPersistenceService.sqlForStream(stream);
-            assertNotNull(sql, stream);
-            assertTrue(sql.contains(", replay_id)"),
-                    stream + " INSERT 必须包含 replay_id 列");
-            assertTrue(sql.contains("INSERT INTO zncb_" + stream),
-                    stream + " 表名必须正确");
+    void streamAllowlistCoversFiveStreamsAndRejectsUnknown() {
+        for (String stream : List.of("gps", "wind", "depth", "rudder", "engine", "engine-batch")) {
+            assertTrue(NmeaDataPersistenceService.supportsStream(stream));
         }
-        assertNull(NmeaDataPersistenceService.sqlForStream("nope"));
+        org.junit.jupiter.api.Assertions.assertFalse(NmeaDataPersistenceService.supportsStream("nope"));
+        org.junit.jupiter.api.Assertions.assertFalse(NmeaDataPersistenceService.supportsStream(null));
+    }
+
+    private EnginePoint point() {
+        return EnginePoint.now("413999999", 1, 1500.0, 85.0, 0.5, 0.4, 420.0, 0.25,
+                2.8, 75.0, 24.5, 12000, 1, 0, 0);
+    }
+    private void saveGps(NmeaDataPersistenceService service) {
+        service.saveGps("RMC", "SERIAL", 31.2, 121.5, 12.0, 180.0,
+                180.0, 180.0, 0.0, 10.0, 8, 1.0, 1, "A", "413999999");
     }
 
     private static final String ENGINE_DDL = """
@@ -246,43 +185,22 @@ class PersistenceFallbackTest {
         return jt;
     }
 
-    /**
-     * 模拟“已提交但返回异常”：第一次真实执行后抛异常，之后透传。
-     * 只对匹配的 SQL 生效，其他语句直接透传。
-     */
-    static class CommitUnknownJdbcTemplate extends JdbcTemplate {
-        private final java.util.concurrent.atomic.AtomicBoolean armed =
-                new java.util.concurrent.atomic.AtomicBoolean(true);
-        private final java.util.function.Predicate<String> match;
-
-        CommitUnknownJdbcTemplate(javax.sql.DataSource ds, java.util.function.Predicate<String> match) {
-            super(ds);
-            this.match = match;
-        }
-
-        @Override
-        public int update(String sql, Object... args) throws DataAccessException {
-            if (armed.compareAndSet(true, false) && match.test(sql)) {
-                int n = super.update(sql, args);
-                assertEquals(1, n);
-                throw new UncategorizedSQLException("commit-unknown", sql,
-                        new SQLException("response lost after commit"));
-            }
-            return super.update(sql, args);
-        }
-    }
-
     @Test
     @DisplayName("规格a：主表第一次已提交但返回异常，重试去重吸收后仍1条")
     void mainUnknownResultAbsorbedOnRetry() throws Exception {
         JdbcTemplate real = h2("speca_", GPS_DDL);
-        CommitUnknownJdbcTemplate flaky = new CommitUnknownJdbcTemplate(
-                real.getDataSource(), sql -> sql.contains("zncb_gps_data"));
+        EdgeTelemetryRepository flaky = org.mockito.Mockito.spy(MyBatisTestSupport.repository(real));
+        var armed = new java.util.concurrent.atomic.AtomicBoolean(true);
+        org.mockito.Mockito.doAnswer(invocation -> {
+            Object result = invocation.callRealMethod();
+            if (armed.getAndSet(false)) throw new RuntimeException("response lost after commit");
+            return result;
+        }).when(flaky).insert(anyString(), any(Object[].class));
         com.smartship.edge.persist.FileFallbackStore store =
                 mock(com.smartship.edge.persist.FileFallbackStore.class);
 
         NmeaDataPersistenceService service =
-                new NmeaDataPersistenceService(flaky, properties, null, metrics, store);
+                new NmeaDataPersistenceService(MyBatisTestSupport.repository(flaky), properties, null, metrics, store);
         service.saveGps("RMC", "SERIAL", 31.2, 121.5, 12.0, 180.0,
                 180.0, 180.0, 0.0, 10.0, 8, 1.0, 1, "A", "413999999");
 
@@ -302,29 +220,20 @@ class PersistenceFallbackTest {
                         + " stream VARCHAR(32), mmsi VARCHAR(32), replay_id VARCHAR(64) NULL,"
                         + " payload TEXT, error VARCHAR(500),"
                         + " CONSTRAINT uk_failed_replay_id UNIQUE (replay_id))");
-        JdbcTemplate flaky = new JdbcTemplate(real.getDataSource()) {
-            private boolean fbArmed = true;
-
-            @Override
-            public int update(String sql, Object... args) throws DataAccessException {
-                if (sql.contains("zncb_gps_data")) {
-                    throw new RuntimeException("main down");
-                }
-                if (sql.contains("zncb_failed_writes") && fbArmed) {
-                    fbArmed = false;
-                    int n = super.update(sql, args);
-                    assertEquals(1, n);
-                    throw new UncategorizedSQLException("commit-unknown", sql,
-                            new SQLException("response lost after commit"));
-                }
-                return super.update(sql, args);
-            }
-        };
+        EdgeTelemetryRepository flaky = org.mockito.Mockito.spy(MyBatisTestSupport.repository(real));
+        org.mockito.Mockito.doThrow(new RuntimeException("main down"))
+                .when(flaky).insert(anyString(), any(Object[].class));
+        var armed = new java.util.concurrent.atomic.AtomicBoolean(true);
+        org.mockito.Mockito.doAnswer(invocation -> {
+            Object result = invocation.callRealMethod();
+            if (armed.getAndSet(false)) throw new RuntimeException("response lost after commit");
+            return result;
+        }).when(flaky).insertFallback(any(Object[].class));
         com.smartship.edge.persist.FileFallbackStore store =
                 mock(com.smartship.edge.persist.FileFallbackStore.class);
 
         NmeaDataPersistenceService service =
-                new NmeaDataPersistenceService(flaky, properties, null, metrics, store);
+                new NmeaDataPersistenceService(MyBatisTestSupport.repository(flaky), properties, null, metrics, store);
         service.saveDepth("DPT", "SERIAL", 12.5, 0.5, "413999999");
 
         assertEquals(1L, real.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class),
@@ -349,7 +258,7 @@ class PersistenceFallbackTest {
         // 全程真连接，覆盖 batch→row→absorb 完整路径（mock 连接会污染行补写的 DataSource）。
         JdbcTemplate realJt = new JdbcTemplate(realDs);
         NmeaDataPersistenceService service =
-                new NmeaDataPersistenceService(realJt, properties, null, metrics, store);
+                new NmeaDataPersistenceService(MyBatisTestSupport.repository(realJt), properties, null, metrics, store);
         java.time.LocalDateTime ts = java.time.LocalDateTime.of(2026, 9, 19, 10, 0, 0);
         List<EnginePoint> batch = List.of(
                 new EnginePoint("413999999", 1, 1500.0, 85.0, 0.5, 0.4, 420.0, 0.25,

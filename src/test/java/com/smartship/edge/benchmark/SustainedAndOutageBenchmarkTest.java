@@ -1,5 +1,7 @@
 package com.smartship.edge.benchmark;
 
+import com.smartship.edge.persistence.MyBatisTestSupport;
+import com.smartship.edge.persistence.EdgeTelemetryRepository;
 import com.smartship.edge.benchmark.simulator.CountingMqttGateway;
 import com.smartship.edge.benchmark.support.BenchmarkFixtures;
 import com.smartship.edge.config.EdgeProperties;
@@ -79,6 +81,7 @@ class SustainedAndOutageBenchmarkTest {
     private static final class PersistFixture implements AutoCloseable {
         final com.zaxxer.hikari.HikariDataSource ds;
         final JdbcTemplate jt;
+        final EdgeTelemetryRepository repository;
         final NmeaDataPersistenceService persist;
 
         PersistFixture() {
@@ -90,6 +93,7 @@ class SustainedAndOutageBenchmarkTest {
             ds.setMaximumPoolSize(5);
             ds.setPoolName("bench-pool-" + dbName);
             jt = new JdbcTemplate(ds);
+            repository = MyBatisTestSupport.repository(jt);
             BenchmarkFixtures.createShipTables(jt);
             EdgeProperties properties = new EdgeProperties();
             properties.setMmsi("sustained-bench");
@@ -97,7 +101,7 @@ class SustainedAndOutageBenchmarkTest {
             properties.getCollect().getPersist().setEnabled(true);
             properties.getCollect().getPersist().setMinWriteIntervalSeconds(0);
             persist = new NmeaDataPersistenceService(
-                    jt, properties, new PersistenceThrottle(properties));
+                    repository, properties, new PersistenceThrottle(properties));
         }
 
         @Override
@@ -233,6 +237,7 @@ class SustainedAndOutageBenchmarkTest {
 
     private static final class OutageFixture {
         final JdbcTemplate jt;
+        final EdgeTelemetryRepository repository;
         final DatabaseUploadPoller poller;
         final DatabaseUploadPoller.IncrementalStream stream;
         final DatabaseUploadPoller.LocalShip ship;
@@ -240,6 +245,7 @@ class SustainedAndOutageBenchmarkTest {
 
         OutageFixture(int rows, int pollBatch, long[] sampleIds) {
             jt = BenchmarkFixtures.newH2("outage_bench_" + System.nanoTime());
+            repository = MyBatisTestSupport.repository(jt);
             BenchmarkFixtures.createShipTables(jt);
             for (int i = 0; i < rows; i += 2000) {
                 int end = Math.min(i + 2000, rows);
@@ -261,7 +267,7 @@ class SustainedAndOutageBenchmarkTest {
             properties.getUploader().getPoll().setBatchSize(pollBatch);
             gateway = new CountingMqttGateway(rows, sampleIds);
             ship = new DatabaseUploadPoller.LocalShip(SHIP_ID, MMSI);
-            poller = new DatabaseUploadPoller(properties, jt, gateway.publisher());
+            poller = new DatabaseUploadPoller(properties, repository, gateway.publisher());
             stream = new DatabaseUploadPoller.IncrementalStream("gps", TABLE, "nmea_gps", "nmea_gps");
         }
 
@@ -279,7 +285,7 @@ class SustainedAndOutageBenchmarkTest {
             int rounds = 0;
             while (rounds < cap) {
                 long before = cursor();
-                poller.uploadIncrementalStream(jt, ship, stream);
+                poller.uploadIncrementalStream(repository, ship, stream);
                 rounds++;
                 if (cursor() == before) {
                     break;
