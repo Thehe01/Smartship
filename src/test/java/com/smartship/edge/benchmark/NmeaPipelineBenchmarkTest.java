@@ -1,5 +1,7 @@
 package com.smartship.edge.benchmark;
 
+import com.smartship.edge.persistence.MyBatisTestSupport;
+import com.smartship.edge.persistence.EdgeTelemetryRepository;
 import com.smartship.edge.benchmark.simulator.NmeaDeviceSimulator;
 import com.smartship.edge.benchmark.simulator.NmeaSimulationConfig;
 import com.smartship.edge.benchmark.support.BenchmarkFixtures;
@@ -85,7 +87,7 @@ class NmeaPipelineBenchmarkTest {
             properties.getCollect().getPersist().setMinWriteIntervalSeconds(throttleSeconds);
 
             NmeaDataPersistenceService real =
-                    new NmeaDataPersistenceService(jt, properties, new PersistenceThrottle(properties));
+                    new NmeaDataPersistenceService(MyBatisTestSupport.repository(jt), properties, new PersistenceThrottle(properties));
             persistSpy = spy(real);
             NmeaDataHandler handler = new NmeaDataHandler(persistSpy, new PersistenceThrottle(properties));
             parser = new NmeaParser(handler, persistSpy, properties,

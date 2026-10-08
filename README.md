@@ -2,6 +2,7 @@
 
 [![Java](https://img.shields.io/badge/Java-17-orange.svg)](https://openjdk.org/)
 [![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.3.5-brightgreen.svg)](https://spring.io/projects/spring-boot)
+[![MyBatis](https://img.shields.io/badge/MyBatis-3.5-blue.svg)](https://mybatis.org/mybatis-3/)
 [![CI](https://github.com/Thehe01/Smartship/actions/workflows/ci.yml/badge.svg)](https://github.com/Thehe01/Smartship/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
@@ -34,7 +35,7 @@ flowchart TD
     subgraph 存储与保护 ["3. 单船存储、削峰与双级兜底"]
         Handler --> Throttle{PersistenceThrottle<br/>无锁 CAS 自旋节流器}
         ModbusP --> Throttle
-        Throttle -->|达到写入间隔: CAS成功| Persist[NmeaDataPersistenceService<br/>单 JdbcTemplate 直写本船库]
+        Throttle -->|达到写入间隔: CAS成功| Persist[NmeaDataPersistenceService<br/>MyBatis Mapper 写本船库]
         Init[ShipLocalInitializer<br/>建表 + replay_id 存量迁移] -->|schemaReady| Persist
         Persist -->|主表 INSERT 失败| DbFb[(zncb_failed_writes<br/>DB 兜底表)]
         DbFb -->|DB 也不可写| Spool[(FileFallbackStore<br/>磁盘 JSONL spool, SYNC + 轮转 + 总量上限)]
@@ -182,3 +183,13 @@ smartship.edge.persist:
 ## 📄 开源许可证
 
 本项目遵循 [Apache 2.0 License](LICENSE)。
+
+## MyBatis 持久化
+
+技术栈：Java 17、Spring Boot 3.3.5、MyBatis（Spring Boot Starter 3.0.3）、MySQL、HikariCP、MQTT。
+
+- `EdgeTelemetryMapper` / `TelemetrySqlProvider` 负责五类遥测写入、兜底表读写、增量查询和上传游标；表名来自固定白名单，业务值均通过 `#{...}` 参数绑定。
+- `EdgeTelemetryRepository` 通过 Spring `TransactionTemplate` 管理短事务。主机批量写入使用多行 INSERT，整批失败回滚后逐行重试；DB 回放的主表 INSERT 与兜底 DELETE 同事务提交。
+- `replay_id`、磁盘 JSONL 编码和上传 `msg_id` 契约保持不变；MyBatis 查询结果保留 NULL，并将列名及时间转换为原上传格式。
+- `ShipLocalInitializer` 的启动建表、旧库结构升级与 JDBC 元数据检查保留 JDBC；业务数据读写均使用 MyBatis。
+- 测试用 JDBC 建库和断言结果，实际持久化路径使用真实 MyBatis Mapper。两仓同名 PR 分支存在时，CI 自动使用配套分支验证跨仓 E2E，否则使用对方 `main`。

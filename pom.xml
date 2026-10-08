@@ -48,14 +48,15 @@
     </properties>
 
     <dependencies>
-        <!-- Spring Boot Web & JDBC -->
+        <!-- Spring Boot Web & MyBatis -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
         <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-jdbc</artifactId>
+            <groupId>org.mybatis.spring.boot</groupId>
+            <artifactId>mybatis-spring-boot-starter</artifactId>
+            <version>3.0.3</version>
         </dependency>
 
         <!-- MySQL Driver -->

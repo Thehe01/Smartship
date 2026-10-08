@@ -1,5 +1,7 @@
 package com.smartship.edge.benchmark;
 
+import com.smartship.edge.persistence.MyBatisTestSupport;
+import com.smartship.edge.persistence.EdgeTelemetryRepository;
 import com.smartship.edge.benchmark.support.BenchmarkFixtures;
 import com.smartship.edge.config.EdgeProperties;
 import com.smartship.edge.routing.PersistenceThrottle;
@@ -31,11 +33,11 @@ import static org.mockito.ArgumentMatchers.any;
  * <p>
  * 同 1 万行规模下对照两种走法：
  * A {@code batch-single-row}：1 行 = 1 池任务 = 1 次 JDBC round-trip（现状成本模型）；
- * B {@code batch-batched}：按船攒批（默认 500 行/批），1 批 = 1 池任务 = 每船 1 次 batchUpdate。
+ * B {@code batch-batched}：按船攒批（默认 500 行/批），1 批 = 1 池任务 = 每船 1 次 MyBatis-multi-row-INSERT。
  * <p>
  * 诚实声明：单行臂直接提交任务（无 Spring @Async 那一跳），数字相对生产略乐观，
  * 因此批量臂的优势是被低估而非夸大；50 船只做 mmsi 标签轮转 + 服务内按船分组，
- * 路由收敛本身由 multiship 场景覆盖；H2 单库串行执行分组 batchUpdate，比生产
+ * 路由收敛本身由 multiship 场景覆盖；H2 单库串行执行分组 MyBatis-multi-row-INSERT，比生产
  * 50 个分船库并行更慢，同样是保守口径。
  */
 @Tag("benchmark")
@@ -88,7 +90,7 @@ class BatchPersistenceBenchmarkTest {
             properties.getCollect().getPersist().setEnabled(true);
             properties.getCollect().getPersist().setMinWriteIntervalSeconds(0);
             persist = new NmeaDataPersistenceService(
-                    jt, properties, new PersistenceThrottle(properties));
+                    MyBatisTestSupport.repository(jt), properties, new PersistenceThrottle(properties));
         }
 
         long engineRows() {
@@ -210,7 +212,7 @@ class BatchPersistenceBenchmarkTest {
     }
 
     @Test
-    @DisplayName("batch-batched: 攒批 1批1任务每船1batchUpdate 的 1万行对照")
+    @DisplayName("batch-batched: 攒批 1批1任务每船1MyBatis-multi-row-INSERT 的 1万行对照")
     void batchedBreakthrough() throws Exception {
         int rows = Integer.parseInt(prop("benchmark.batch.rows", "10000").trim());
         int ships = Integer.parseInt(prop("benchmark.batch.ships", "50").trim());
@@ -219,14 +221,14 @@ class BatchPersistenceBenchmarkTest {
                 .param("rows", rows)
                 .param("ships", ships)
                 .param("batch_size", batchSize)
-                .param("db", "real-H2-batchUpdate-per-ship-per-batch")
+                .param("db", "real-H2-MyBatis-multi-row-INSERT-per-ship-per-batch")
                 .param("warmup_runs", 1)
                 .param("measured_runs", 3)
                 .param("pool.core", 2)
                 .param("pool.max", 4)
                 .param("pool.queue", 500)
                 .note("突破走法：WriteBatcher 按船攒满 " + batchSize + " 行即作为 1 个池任务提交，"
-                        + "任务内按船分组 batchUpdate；尾批 drainAll 显式刷出；"
+                        + "任务内按船分组 MyBatis-multi-row-INSERT；尾批 drainAll 显式刷出；"
                         + "同单行臂对比 e2e p99 与吞吐；计数器取末轮 measured 单轮值");
         for (int run = 0; run < 4; run++) {
             boolean warmup = run == 0;

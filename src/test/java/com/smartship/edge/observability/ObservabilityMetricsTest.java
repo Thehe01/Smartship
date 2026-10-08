@@ -1,5 +1,7 @@
 package com.smartship.edge.observability;
 
+import com.smartship.edge.persistence.MyBatisTestSupport;
+import com.smartship.edge.persistence.EdgeTelemetryRepository;
 import com.smartship.edge.config.EdgeProperties;
 import com.smartship.edge.routing.pool.MonitoredCallerRunsPolicy;
 import com.smartship.edge.routing.pool.PersistenceAsyncConfig;
@@ -137,7 +139,7 @@ public class ObservabilityMetricsTest {
                 .setFallbackDir(tempDir.resolve("fallback").toString());
 
         NmeaDataPersistenceService service = new NmeaDataPersistenceService(
-                jt, properties, null, smartShipMetrics);
+                MyBatisTestSupport.repository(jt), properties, null, smartShipMetrics);
 
         // 1. 成功落库
         service.saveGps("RMC", "SERIAL", 31.2, 121.5, 12.0, 180.0,
@@ -157,10 +159,10 @@ public class ObservabilityMetricsTest {
         assertEquals(1, timer.count());
 
         // 2. 失败落库（模拟执行 SQL 异常）：单库模式下用第二个 service 实例
-        JdbcTemplate errorJt = mock(JdbcTemplate.class);
-        when(errorJt.update(anyString(), any(Object[].class))).thenThrow(new RuntimeException("DB down"));
+        EdgeTelemetryRepository errorJt = mock(EdgeTelemetryRepository.class);
+        when(errorJt.insert(anyString(), any(Object[].class))).thenThrow(new RuntimeException("DB down"));
         NmeaDataPersistenceService failService = new NmeaDataPersistenceService(
-                errorJt, properties, null, smartShipMetrics);
+                MyBatisTestSupport.repository(errorJt), properties, null, smartShipMetrics);
 
         failService.saveGps("RMC", "SERIAL", 31.2, 121.5, 12.0, 180.0,
                 180.0, 180.0, 0.0, 10.0, 8, 1.0, 1, "A", "413888888");
@@ -297,7 +299,7 @@ public class ObservabilityMetricsTest {
         );
 
         DatabaseUploadPoller poller = new DatabaseUploadPoller(
-                properties, jt, mqttPublisher, smartShipMetrics, null,
+                properties, MyBatisTestSupport.repository(jt), mqttPublisher, smartShipMetrics, null,
                 new com.smartship.edge.uploader.UploadAckTracker()
         );
 
@@ -306,7 +308,7 @@ public class ObservabilityMetricsTest {
         );
 
         // 第一批上传 PUBACK 全部成功：只记在途，游标不动（等 Application ACK）。
-        poller.uploadIncrementalStream(jt, ship, gpsStream);
+        poller.uploadIncrementalStream(MyBatisTestSupport.repository(jt), ship, gpsStream);
 
         Long cursorAfterFirst = jt.queryForObject(
                 "SELECT last_uploaded_id FROM zncb_upload_cursor WHERE stream_name = 'zncb_gps_data'", Long.class);
@@ -335,7 +337,7 @@ public class ObservabilityMetricsTest {
         when(mqttPublisher.publish(eq("413999999"), eq("nmea_gps"), eq("nmea_gps"), argThat(map -> Long.valueOf(5).equals(map.get("id")))))
                 .thenReturn(false);
 
-        poller.uploadIncrementalStream(jt, ship, gpsStream);
+        poller.uploadIncrementalStream(MyBatisTestSupport.repository(jt), ship, gpsStream);
 
         Long cursorAfterSecond = jt.queryForObject(
                 "SELECT last_uploaded_id FROM zncb_upload_cursor WHERE stream_name = 'zncb_gps_data'", Long.class);
@@ -385,7 +387,7 @@ public class ObservabilityMetricsTest {
         }
         jt.execute("INSERT INTO zncb_upload_cursor (stream_name, partition_key, last_uploaded_id) VALUES ('zncb_gps_data', '', 4)");
 
-        UploadBacklogMetrics backlogMetrics = new UploadBacklogMetrics(jt);
+        UploadBacklogMetrics backlogMetrics = new UploadBacklogMetrics(MyBatisTestSupport.repository(jt));
         backlogMetrics.bindTo(registry);
 
         Gauge backlogGauge = registry.find("smartship_uploader_backlog_rows").gauge();
@@ -402,10 +404,10 @@ public class ObservabilityMetricsTest {
         // 删除游标表后 refresh 不抛异常、保留历史值（queryCursorId 捕获 BadSqlGrammarException 返回 0，
         // 但 maxId 仍 10 → backlog=10？为避免歧义，这里直接验证 refresh 不抛且 gauge 有值）
         // 更严格的超时保留语义由 mock 单测覆盖：构造 failing jt 的独立实例验证失败不归零
-        JdbcTemplate failingQueryJt = mock(JdbcTemplate.class);
-        when(failingQueryJt.queryForObject(contains("COALESCE(MAX(id"), eq(Long.class)))
+        EdgeTelemetryRepository failingQueryJt = mock(EdgeTelemetryRepository.class);
+        when(failingQueryJt.maxId(anyString()))
                 .thenThrow(new org.springframework.dao.QueryTimeoutException("DB timeout"));
-        UploadBacklogMetrics failingMetrics = new UploadBacklogMetrics(failingQueryJt);
+        UploadBacklogMetrics failingMetrics = new UploadBacklogMetrics(MyBatisTestSupport.repository(failingQueryJt));
         failingMetrics.bindTo(new SimpleMeterRegistry());
         failingMetrics.refresh();
         assertEquals(0L, failingMetrics.getBacklogRows(), "全失败采样保留初始 0，不抛异常");
@@ -428,8 +430,8 @@ public class ObservabilityMetricsTest {
     @Test
     @DisplayName("测试场景 9: Prometheus scrape 必须无副作用，读取 backlog Gauge 严禁触发任何数据库查询")
     void testPrometheusScrapeDoesNotQueryBusinessDatabase() {
-        JdbcTemplate jtMock = mock(JdbcTemplate.class);
-        UploadBacklogMetrics backlogMetrics = new UploadBacklogMetrics(jtMock);
+        EdgeTelemetryRepository jtMock = mock(EdgeTelemetryRepository.class);
+        UploadBacklogMetrics backlogMetrics = new UploadBacklogMetrics(MyBatisTestSupport.repository(jtMock));
         backlogMetrics.bindTo(registry);
 
         Gauge backlogGauge = registry.find("smartship_uploader_backlog_rows").gauge();
@@ -442,8 +444,7 @@ public class ObservabilityMetricsTest {
         }
 
         // 严格验证：Prometheus 抓取时只读取内存状态，绝对不触碰业务 JdbcTemplate
-        verify(jtMock, never()).queryForObject(anyString(), eq(Long.class));
-        verify(jtMock, never()).query(anyString(), any(org.springframework.jdbc.core.RowMapper.class), any());
+        org.mockito.Mockito.verifyNoInteractions(jtMock);
     }
 
     @Test

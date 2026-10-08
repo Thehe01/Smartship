@@ -88,11 +88,23 @@ jobs:
       - name: Install Edge artifact (this commit, skip its tests)
         run: mvn -B install -DskipTests
 
-      - name: Checkout Shore repo (main)
+      - name: Resolve paired Shore branch
+        id: counterpart
+        env:
+          CANDIDATE_REF: ${{ github.head_ref }}
+        run: |
+          counterpart_ref=main
+          if [ -n "$CANDIDATE_REF" ] && git ls-remote --exit-code --heads \
+              https://github.com/Thehe01/Smartship-Shore.git "refs/heads/$CANDIDATE_REF" >/dev/null 2>&1; then
+            counterpart_ref="$CANDIDATE_REF"
+          fi
+          echo "ref=$counterpart_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Shore repo (paired branch or main)
         uses: actions/checkout@v4
         with:
           repository: Thehe01/Smartship-Shore
-          ref: main
+          ref: ${{ steps.counterpart.outputs.ref }}
           path: .shore-checkout
 
       # GitHub-hosted runners ship Docker, so the Testcontainers-backed
@@ -124,4 +136,4 @@ jobs:
             *"Failures: 0"*", Errors: 0"*", Skipped: 0"*) ;;
             *) echo "FAIL: cross-repo E2E did not pass cleanly"; exit 1;;
           esac
-          echo "Cross-repo protocol E2E green: Edge(this commit) <-> Shore(main)."
+          echo "Cross-repo protocol E2E green: Edge(this commit) <-> Shore(paired branch or main)."

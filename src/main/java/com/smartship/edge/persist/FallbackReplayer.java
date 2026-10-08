@@ -8,7 +8,9 @@ import java.util.ArrayList;
 import java.util.List;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.jdbc.core.JdbcTemplate;
+import com.smartship.edge.persistence.EdgeTelemetryRepository;
+import com.smartship.edge.persistence.FallbackRow;
+import com.smartship.edge.persistence.InvalidTelemetryWriteException;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
@@ -46,7 +48,7 @@ public class FallbackReplayer {
     /** 单轮 DB 分页上限：毒行再多也有界终止。 */
     private static final int MAX_DB_PAGES = 10;
 
-    private final JdbcTemplate jdbcTemplate;
+    private final EdgeTelemetryRepository repository;
     private final EdgeProperties properties;
     private final FileFallbackStore store;
     private final SmartShipMetrics metrics;
@@ -88,15 +90,9 @@ public class FallbackReplayer {
         final int pageSize = 100;
         boolean dbDown = false;
         while (replayed < budget && !dbDown) {
-            final List<DbRow> rows;
+            final List<FallbackRow> rows;
             try {
-                rows = jdbcTemplate.query(
-                        "SELECT id, stream, mmsi, replay_id, payload FROM zncb_failed_writes"
-                                + " WHERE id > ? ORDER BY id ASC LIMIT ?",
-                        (rs, n) -> new DbRow(rs.getLong("id"), rs.getString("stream"),
-                                rs.getString("mmsi"), rs.getString("replay_id"),
-                                rs.getString("payload")),
-                        cursor, pageSize);
+                rows = repository.pendingFallback(cursor, pageSize);
             } catch (Exception e) {
                 log.debug("[Fallback-Replay] 兜底表不可读，跳过 DB 阶段: {}", e.getMessage());
                 break;
@@ -104,7 +100,7 @@ public class FallbackReplayer {
             if (rows.isEmpty()) {
                 break;
             }
-            for (DbRow row : rows) {
+            for (FallbackRow row : rows) {
                 cursor = row.id();
                 if (replayed >= budget) {
                     break;
@@ -124,7 +120,7 @@ public class FallbackReplayer {
                     }
                     continue;
                 }
-                if (NmeaDataPersistenceService.sqlForStream(parsed.stream()) == null) {
+                if (!NmeaDataPersistenceService.supportsStream(parsed.stream())) {
                     if (noteAttempt(key)) {
                         log.warn("[Fallback-Replay] 兜底表未知流跳过保留 (id={}, stream={})",
                                 row.id(), parsed.stream());
@@ -153,9 +149,6 @@ public class FallbackReplayer {
         return budget - replayed;
     }
 
-    private record DbRow(long id, String stream, String mmsi, String replayId, String payload) {
-    }
-
     /**
      * 单行 DB 回放：INSERT 主表 + DELETE 兜底行同一本地事务原子提交。
      * <p>崩溃要么全有要么全无——消灭“写完主表、没删兜底行”导致的重复窗口
@@ -164,57 +157,20 @@ public class FallbackReplayer {
      * 后者调用方记毒（超限跳过，避免一坏行永久堵住队列）。
      */
     private RowOutcome replayDbRow(
-            DbRow row, FileFallbackStore.ParsedLine parsed, String replayId) {
-        String sql = NmeaDataPersistenceService.sqlForStream(parsed.stream());
-        Object[] jdbcArgs = withReplayId(parsed, replayId);
-        javax.sql.DataSource ds = jdbcTemplate.getDataSource();
-        if (ds == null) {
-            if (metrics != null) {
-                metrics.recordFallbackReplay(false);
-            }
-            log.warn("[Fallback-Replay] 无 DataSource，保留现场下轮重试: stream={}",
-                    parsed.stream());
-            return RowOutcome.TRANSIENT_FAIL;
-        }
-        try (java.sql.Connection con = ds.getConnection()) {
-            con.setAutoCommit(false);
-            try {
-                org.springframework.jdbc.datasource.SingleConnectionDataSource scf =
-                        new org.springframework.jdbc.datasource.SingleConnectionDataSource(con, true);
-                JdbcTemplate tx = new JdbcTemplate(scf);
-                try {
-                    tx.update(sql, jdbcArgs);
-                } catch (org.springframework.dao.DuplicateKeyException dup) {
-                    // 崩溃重试：主表行已在，唯一约束吸收重复（与 ODKU 等价，
-                    // 且 Spring 在 MySQL/H2 下都翻译为该异常，单路径可测）。
-                    log.info("[Fallback-Replay] 重复回放被唯一约束吸收: stream={}, replay_id={}",
-                            parsed.stream(), parsed.replayId());
-                }
-                tx.update("DELETE FROM zncb_failed_writes WHERE id = ?", row.id());
-                con.commit();
-                if (metrics != null) {
-                    metrics.recordFallbackReplay(true);
-                }
-                return RowOutcome.OK;
-            } catch (Exception e) {
-                rollbackQuietly(con);
-                if (metrics != null) {
-                    metrics.recordFallbackReplay(false);
-                }
-                if (isDeterministicFailure(e)) {
-                    log.warn("[Fallback-Replay] 坏行保留现场（记毒）: stream={}, err={}",
-                            parsed.stream(), e.getMessage());
-                    return RowOutcome.DATA_FAIL;
-                }
-                log.warn("[Fallback-Replay] 瞬时故障保留现场（不记毒，下轮重试）: stream={}, err={}",
-                        parsed.stream(), e.getMessage());
-                return RowOutcome.TRANSIENT_FAIL;
-            }
+            FallbackRow row, FileFallbackStore.ParsedLine parsed, String replayId) {
+        Object[] args = withReplayId(parsed, replayId);
+        try {
+            repository.replayFallback(row.id(), parsed.stream(), args);
+            if (metrics != null) metrics.recordFallbackReplay(true);
+            return RowOutcome.OK;
         } catch (Exception e) {
-            if (metrics != null) {
-                metrics.recordFallbackReplay(false);
+            if (metrics != null) metrics.recordFallbackReplay(false);
+            if (isDeterministicFailure(e)) {
+                log.warn("[Fallback-Replay] 坏行保留现场（记毒）: stream={}, err={}",
+                        parsed.stream(), e.getMessage());
+                return RowOutcome.DATA_FAIL;
             }
-            log.warn("[Fallback-Replay] 回放连接失败保留现场: stream={}, err={}",
+            log.warn("[Fallback-Replay] 瞬时故障保留现场（不记毒，下轮重试）: stream={}, err={}",
                     parsed.stream(), e.getMessage());
             return RowOutcome.TRANSIENT_FAIL;
         }
@@ -240,6 +196,7 @@ public class FallbackReplayer {
                 return false;
             }
             if (cur instanceof org.springframework.dao.DataIntegrityViolationException
+                    || cur instanceof InvalidTelemetryWriteException
                     || cur instanceof org.springframework.jdbc.BadSqlGrammarException
                     || cur instanceof
                     org.springframework.dao.InvalidDataAccessResourceUsageException
@@ -259,14 +216,6 @@ public class FallbackReplayer {
         return false;
     }
 
-    private static void rollbackQuietly(java.sql.Connection con) {
-        try {
-            con.rollback();
-        } catch (Exception ignored) {
-            // 回滚失败不掩盖原始异常
-        }
-    }
-
     /** 记一次失败；返回 true 表示刚达到上限（调用方打一次日志）。 */
     private boolean noteAttempt(String key) {
         int n = rowAttempts.getOrDefault(key, 0) + 1;
@@ -281,8 +230,7 @@ public class FallbackReplayer {
     /** 通用单行回放：成功/失败计数，失败不抛（重复由主表 replay_id 唯一约束吸收）。 */
     private boolean replayParsed(
             String stream, String replayId, List<FileFallbackStore.TypedArg> args) {
-        String sql = NmeaDataPersistenceService.sqlForStream(stream);
-        if (sql == null) {
+        if (!NmeaDataPersistenceService.supportsStream(stream)) {
             log.warn("[Fallback-Replay] 未知流 {}，跳过（计数丢失）", stream);
             if (metrics != null) {
                 metrics.recordFallbackDropped(1);
@@ -291,9 +239,9 @@ public class FallbackReplayer {
         }
         try {
             Object[] decoded = args.stream().map(FileFallbackStore::decode).toArray();
-            Object[] jdbcArgs = java.util.Arrays.copyOf(decoded, decoded.length + 1);
-            jdbcArgs[decoded.length] = replayId;
-            jdbcTemplate.update(sql, jdbcArgs);
+            Object[] boundArgs = java.util.Arrays.copyOf(decoded, decoded.length + 1);
+            boundArgs[decoded.length] = replayId;
+            repository.insert(stream, boundArgs);
             if (metrics != null) {
                 metrics.recordFallbackReplay(true);
             }
@@ -319,9 +267,9 @@ public class FallbackReplayer {
     private Object[] withReplayId(FileFallbackStore.ParsedLine parsed, String replayId) {
         Object[] decoded =
                 parsed.args().stream().map(FileFallbackStore::decode).toArray();
-        Object[] jdbcArgs = java.util.Arrays.copyOf(decoded, decoded.length + 1);
-        jdbcArgs[decoded.length] = replayId;
-        return jdbcArgs;
+        Object[] boundArgs = java.util.Arrays.copyOf(decoded, decoded.length + 1);
+        boundArgs[decoded.length] = replayId;
+        return boundArgs;
     }
 
     private static boolean hasText(String s) {

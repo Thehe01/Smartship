@@ -1,5 +1,7 @@
 package com.smartship.edge.persist;
 
+import com.smartship.edge.persistence.MyBatisTestSupport;
+import com.smartship.edge.persistence.EdgeTelemetryRepository;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -64,8 +66,10 @@ class FallbackReplayTest {
                 100L * 1024L * 1024L);
 
         // 阶段一：DB 全挂（主表+兜底表都抛）→ saveGps 转磁盘 spool
-        JdbcTemplate deadJt = mock(JdbcTemplate.class);
-        when(deadJt.update(anyString(), any(Object[].class)))
+        EdgeTelemetryRepository deadJt = mock(EdgeTelemetryRepository.class);
+        when(deadJt.insert(anyString(), any(Object[].class)))
+                .thenThrow(new RuntimeException("MySQL down"));
+        when(deadJt.insertFallback(any(Object[].class)))
                 .thenThrow(new RuntimeException("MySQL down"));
         EdgeProperties properties = new EdgeProperties();
         properties.setMmsi("413999999");
@@ -74,7 +78,7 @@ class FallbackReplayTest {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
         SmartShipMetrics metrics = new SmartShipMetrics(registry);
         NmeaDataPersistenceService deadService = new NmeaDataPersistenceService(
-                deadJt, properties, null, metrics, store);
+                MyBatisTestSupport.repository(deadJt), properties, null, metrics, store);
         deadService.saveGps("RMC", "SERIAL", 31.2, 121.5, 12.0, 180.0,
                 180.0, 180.0, 0.0, 10.0, 8, 1.0, 1, "A", "413999999");
 
@@ -85,7 +89,7 @@ class FallbackReplayTest {
 
         // 阶段二：DB 恢复 → 回放进主表
         JdbcTemplate liveJt = realDb();
-        FallbackReplayer replayer = new FallbackReplayer(liveJt, properties, store, metrics);
+        FallbackReplayer replayer = new FallbackReplayer(MyBatisTestSupport.repository(liveJt), properties, store, metrics);
         replayer.replay();
 
         Long rows = liveJt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class);
@@ -102,12 +106,12 @@ class FallbackReplayTest {
                 100L * 1024L * 1024L);
         store.spool("gps", "413999999", "r-down-1", gpsArgs());
 
-        JdbcTemplate deadJt = mock(JdbcTemplate.class);
-        when(deadJt.update(anyString(), any(Object[].class)))
+        EdgeTelemetryRepository deadJt = mock(EdgeTelemetryRepository.class);
+        when(deadJt.insert(anyString(), any(Object[].class)))
                 .thenThrow(new RuntimeException("still down"));
         EdgeProperties properties = new EdgeProperties();
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
-        FallbackReplayer replayer = new FallbackReplayer(deadJt, properties, store,
+        FallbackReplayer replayer = new FallbackReplayer(MyBatisTestSupport.repository(deadJt), properties, store,
                 new SmartShipMetrics(registry));
         replayer.replay();
 
@@ -151,7 +155,7 @@ class FallbackReplayTest {
 
         EdgeProperties properties = new EdgeProperties();
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
-        FallbackReplayer replayer = new FallbackReplayer(jt, properties, new FileFallbackStore(tempDir, 1024L, 4096L), new SmartShipMetrics(registry));
+        FallbackReplayer replayer = new FallbackReplayer(MyBatisTestSupport.repository(jt), properties, new FileFallbackStore(tempDir, 1024L, 4096L), new SmartShipMetrics(registry));
         replayer.replay();
 
         assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class),
@@ -171,7 +175,7 @@ class FallbackReplayTest {
 
         EdgeProperties properties = new EdgeProperties();
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
-        FallbackReplayer replayer = new FallbackReplayer(jt, properties, new FileFallbackStore(tempDir, 1024L, 4096L), new SmartShipMetrics(registry));
+        FallbackReplayer replayer = new FallbackReplayer(MyBatisTestSupport.repository(jt), properties, new FileFallbackStore(tempDir, 1024L, 4096L), new SmartShipMetrics(registry));
         replayer.replay();
 
         assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_failed_writes", Long.class),
@@ -188,7 +192,7 @@ class FallbackReplayTest {
 
         EdgeProperties properties = new EdgeProperties();
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
-        FallbackReplayer replayer = new FallbackReplayer(jt, properties, new FileFallbackStore(tempDir, 1024L, 4096L), new SmartShipMetrics(registry));
+        FallbackReplayer replayer = new FallbackReplayer(MyBatisTestSupport.repository(jt), properties, new FileFallbackStore(tempDir, 1024L, 4096L), new SmartShipMetrics(registry));
         for (int i = 0; i < 2 * FallbackReplayer.MAX_ROW_ATTEMPTS + 2; i++) {
             replayer.replay();
         }
@@ -210,7 +214,7 @@ class FallbackReplayTest {
 
         EdgeProperties properties = new EdgeProperties();
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
-        FallbackReplayer replayer = new FallbackReplayer(jt, properties, new FileFallbackStore(tempDir, 1024L, 4096L), new SmartShipMetrics(registry));
+        FallbackReplayer replayer = new FallbackReplayer(MyBatisTestSupport.repository(jt), properties, new FileFallbackStore(tempDir, 1024L, 4096L), new SmartShipMetrics(registry));
         // 先把毒行记次刷满（模拟长期滞留）
         for (int i = 0; i < FallbackReplayer.MAX_ROW_ATTEMPTS + 1; i++) {
             replayer.replayDbTable(10);
@@ -261,7 +265,7 @@ class FallbackReplayTest {
                         java.util.List.of(rec, rec2), 0));
 
         EdgeProperties properties = new EdgeProperties();
-        FallbackReplayer replayer = new FallbackReplayer(jt, properties, store,
+        FallbackReplayer replayer = new FallbackReplayer(MyBatisTestSupport.repository(jt), properties, store,
                 new SmartShipMetrics(new SimpleMeterRegistry()));
         replayer.replayFile(file, 10);
 
@@ -285,7 +289,7 @@ class FallbackReplayTest {
 
         EdgeProperties properties = new EdgeProperties();
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
-        FallbackReplayer replayer = new FallbackReplayer(jt, properties, new FileFallbackStore(tempDir, 1024L, 4096L), new SmartShipMetrics(registry));
+        FallbackReplayer replayer = new FallbackReplayer(MyBatisTestSupport.repository(jt), properties, new FileFallbackStore(tempDir, 1024L, 4096L), new SmartShipMetrics(registry));
         // 第一轮正常回放：主表 1 行，兜底删行
         replayer.replay();
         assertEquals(1L, jt.queryForObject("SELECT COUNT(*) FROM zncb_gps_data", Long.class));
@@ -325,7 +329,7 @@ class FallbackReplayTest {
                 "boom");
 
         EdgeProperties properties = new EdgeProperties();
-        FallbackReplayer replayer = new FallbackReplayer(jt, properties, new FileFallbackStore(tempDir, 1024L, 4096L),
+        FallbackReplayer replayer = new FallbackReplayer(MyBatisTestSupport.repository(jt), properties, new FileFallbackStore(tempDir, 1024L, 4096L),
                 new SmartShipMetrics(new SimpleMeterRegistry()));
         // 单轮、默认预算：毒行不消耗 budget，游标翻页直达正常行
         replayer.replayDbTable(200);
@@ -352,6 +356,9 @@ class FallbackReplayTest {
         assertTrue(FallbackReplayer.isDeterministicFailure(
                 new RuntimeException("wrap",
                         new org.springframework.dao.DataIntegrityViolationException("c"))));
+        assertTrue(FallbackReplayer.isDeterministicFailure(
+                new org.mybatis.spring.MyBatisSystemException(
+                        new com.smartship.edge.persistence.InvalidTelemetryWriteException("invalid args"))));
 
         // 瞬时：未知一律按瞬时（宁可多重试，绝不错杀）
         assertFalse(FallbackReplayer.isDeterministicFailure(new RuntimeException("boom")));
@@ -388,7 +395,7 @@ class FallbackReplayTest {
                 "boom");
 
         EdgeProperties properties = new EdgeProperties();
-        FallbackReplayer replayer = new FallbackReplayer(jt, properties,
+        FallbackReplayer replayer = new FallbackReplayer(MyBatisTestSupport.repository(jt), properties,
                 new FileFallbackStore(tempDir, 1024L, 4096L),
                 new SmartShipMetrics(new SimpleMeterRegistry()));
 
@@ -421,7 +428,7 @@ class FallbackReplayTest {
                 "boom");
 
         EdgeProperties properties = new EdgeProperties();
-        FallbackReplayer replayer = new FallbackReplayer(jt, properties,
+        FallbackReplayer replayer = new FallbackReplayer(MyBatisTestSupport.repository(jt), properties,
                 new FileFallbackStore(tempDir, 1024L, 4096L),
                 new SmartShipMetrics(new SimpleMeterRegistry()));
 
@@ -482,7 +489,7 @@ class FallbackReplayTest {
         store.spool("gps", "413999999", sharedKey, args);
 
         EdgeProperties properties = new EdgeProperties();
-        FallbackReplayer replayer = new FallbackReplayer(jt, properties, store,
+        FallbackReplayer replayer = new FallbackReplayer(MyBatisTestSupport.repository(jt), properties, store,
                 new SmartShipMetrics(new SimpleMeterRegistry()));
         replayer.replay();
 

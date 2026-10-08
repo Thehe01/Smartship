@@ -1,5 +1,7 @@
 package com.smartship.edge.benchmark;
 
+import com.smartship.edge.persistence.MyBatisTestSupport;
+import com.smartship.edge.persistence.EdgeTelemetryRepository;
 import com.smartship.edge.benchmark.simulator.FaultInjectingMqttGateway;
 import com.smartship.edge.benchmark.support.BenchmarkFixtures;
 import com.smartship.edge.config.EdgeProperties;
@@ -55,6 +57,7 @@ class MqttRecoveryBenchmarkTest {
 
     private static final class Fixture {
         final JdbcTemplate jt;
+        final EdgeTelemetryRepository repository;
         final DatabaseUploadPoller poller;
         final DatabaseUploadPoller.IncrementalStream stream;
         final DatabaseUploadPoller.LocalShip ship;
@@ -62,6 +65,7 @@ class MqttRecoveryBenchmarkTest {
 
         Fixture(int rows, int batchSize) {
             jt = BenchmarkFixtures.newH2("mqtt_bench_" + System.nanoTime());
+            repository = MyBatisTestSupport.repository(jt);
             BenchmarkFixtures.createShipTables(jt);
             for (int i = 0; i < rows; i += 1000) {
                 int end = Math.min(i + 1000, rows);
@@ -83,7 +87,7 @@ class MqttRecoveryBenchmarkTest {
             properties.getUploader().getPoll().setBatchSize(batchSize);
             gateway = new FaultInjectingMqttGateway();
             ship = new DatabaseUploadPoller.LocalShip(SHIP_ID, MMSI);
-            poller = new DatabaseUploadPoller(properties, jt, gateway.publisher());
+            poller = new DatabaseUploadPoller(properties, repository, gateway.publisher());
             stream = new DatabaseUploadPoller.IncrementalStream("gps", TABLE, "nmea_gps", "nmea_gps");
         }
 
@@ -102,7 +106,7 @@ class MqttRecoveryBenchmarkTest {
             int rounds = 0;
             while (rounds < 500) {
                 long before = cursor();
-                poller.uploadIncrementalStream(jt, ship, stream);
+                poller.uploadIncrementalStream(repository, ship, stream);
                 rounds++;
                 if (cursor() == before) {
                     break;
@@ -181,25 +185,21 @@ class MqttRecoveryBenchmarkTest {
         javax.sql.DataSource ds = f.jt.getDataSource();
         assertNotNull(ds);
         java.util.concurrent.atomic.AtomicBoolean crashed = new java.util.concurrent.atomic.AtomicBoolean(false);
-        JdbcTemplate crashOnceJt = new JdbcTemplate(ds) {
-            @Override
-            public int update(String sql, Object... args) throws DataAccessException {
-                if (!crashed.getAndSet(true) && sql.startsWith("UPDATE zncb_upload_cursor")) {
-                    throw new UncategorizedSQLException("crash-window", sql,
-                            new java.sql.SQLException("simulated crash before cursor commit"));
-                }
-                return super.update(sql, args);
-            }
-        };
+        EdgeTelemetryRepository crashOnceJt = org.mockito.Mockito.spy(f.repository);
+        org.mockito.Mockito.doAnswer(invocation -> {
+            if (!crashed.getAndSet(true)) throw new RuntimeException("simulated crash before cursor commit");
+            return invocation.callRealMethod();
+        }).when(crashOnceJt).updateCursor(org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.anyLong());
 
         EdgeProperties crashProperties = new EdgeProperties();
         crashProperties.getUploader().setEnabled(true);
         crashProperties.getUploader().getPoll().setBatchSize(500);
         DatabaseUploadPoller crashingPoller =
-                new DatabaseUploadPoller(crashProperties, crashOnceJt, f.gateway.publisher());
+                new DatabaseUploadPoller(crashProperties, MyBatisTestSupport.repository(crashOnceJt), f.gateway.publisher());
 
         // 第一次：500 条 publish 成功，cursor 提交失败
-        crashingPoller.uploadIncrementalStream(crashOnceJt, f.ship, f.stream);
+        crashingPoller.uploadIncrementalStream(MyBatisTestSupport.repository(crashOnceJt), f.ship, f.stream);
         assertEquals(500, f.gateway.attempts(), "首批 500 条必须已 publish");
         assertEquals(0, f.cursor(), "crash 后游标必须保持 0");
         List<String> firstIds = f.gateway.publishedForId(1L).stream()
@@ -208,10 +208,10 @@ class MqttRecoveryBenchmarkTest {
 
         // 第二次：同样 poller、全量重跑，id=1 的 msg_id 必须与第一次完全相同
         DatabaseUploadPoller recoveredPoller =
-                new DatabaseUploadPoller(crashProperties, crashOnceJt, f.gateway.publisher());
+                new DatabaseUploadPoller(crashProperties, MyBatisTestSupport.repository(crashOnceJt), f.gateway.publisher());
         int rounds = 0;
         while (f.cursor() < rows && rounds < 50) {
-            recoveredPoller.uploadIncrementalStream(crashOnceJt, f.ship, f.stream);
+            recoveredPoller.uploadIncrementalStream(MyBatisTestSupport.repository(crashOnceJt), f.ship, f.stream);
             rounds++;
         }
         assertEquals(rows, f.cursor());

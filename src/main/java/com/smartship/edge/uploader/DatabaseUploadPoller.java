@@ -6,15 +6,11 @@ import com.smartship.edge.observability.UploadBacklogMetrics;
 import com.smartship.edge.uploader.mqtt.MqttPublisher;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.jdbc.core.JdbcTemplate;
+import com.smartship.edge.persistence.EdgeTelemetryRepository;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
-import java.sql.ResultSet;
-import java.sql.ResultSetMetaData;
-import java.sql.Timestamp;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -62,7 +58,7 @@ public class DatabaseUploadPoller {
     );
 
     private final EdgeProperties properties;
-    private final JdbcTemplate jdbcTemplate;
+    private final EdgeTelemetryRepository repository;
     private final MqttPublisher mqttPublisher;
     private final SmartShipMetrics metrics;
     private final UploadBacklogMetrics backlogMetrics;
@@ -70,22 +66,22 @@ public class DatabaseUploadPoller {
 
     @Autowired
     public DatabaseUploadPoller(EdgeProperties properties,
-                                JdbcTemplate jdbcTemplate,
+                                EdgeTelemetryRepository repository,
                                 MqttPublisher mqttPublisher,
                                 SmartShipMetrics metrics,
                                 UploadBacklogMetrics backlogMetrics) {
-        this(properties, jdbcTemplate, mqttPublisher, metrics, backlogMetrics,
+        this(properties, repository, mqttPublisher, metrics, backlogMetrics,
                 new UploadAckTracker());
     }
 
     public DatabaseUploadPoller(EdgeProperties properties,
-                                JdbcTemplate jdbcTemplate,
+                                EdgeTelemetryRepository repository,
                                 MqttPublisher mqttPublisher,
                                 SmartShipMetrics metrics,
                                 UploadBacklogMetrics backlogMetrics,
                                 UploadAckTracker ackTracker) {
         this.properties = properties;
-        this.jdbcTemplate = jdbcTemplate;
+        this.repository = repository;
         this.mqttPublisher = mqttPublisher;
         this.metrics = metrics;
         this.backlogMetrics = backlogMetrics;
@@ -98,9 +94,9 @@ public class DatabaseUploadPoller {
     }
 
     public DatabaseUploadPoller(EdgeProperties properties,
-                                JdbcTemplate jdbcTemplate,
+                                EdgeTelemetryRepository repository,
                                 MqttPublisher mqttPublisher) {
-        this(properties, jdbcTemplate, mqttPublisher, null, null);
+        this(properties, repository, mqttPublisher, null, null);
     }
 
     /** 测试观察：直接驱动 ACK 流转，无需真实 Broker。 */
@@ -142,9 +138,9 @@ public class DatabaseUploadPoller {
             return;
         }
         try {
-            ensureCursorTable(jdbcTemplate);
+            ensureCursorTable(repository);
             for (IncrementalStream stream : TELEMETRY_STREAMS) {
-                uploadIncrementalStream(jdbcTemplate, ship, stream);
+                uploadIncrementalStream(repository, ship, stream);
             }
         } catch (Exception e) {
             if (metrics != null) {
@@ -160,28 +156,25 @@ public class DatabaseUploadPoller {
         }
     }
 
-    public void uploadIncrementalStream(JdbcTemplate jdbcTemplate,
+    public void uploadIncrementalStream(EdgeTelemetryRepository repository,
                                         LocalShip ship,
                                         IncrementalStream stream) {
         boolean batchRecorded = false;
         try {
-            long lastId = getOrCreateCursorId(jdbcTemplate, stream.tableName());
+            long lastId = getOrCreateCursorId(repository, stream.tableName());
             int limit = Math.max(1, properties.getUploader().getPoll().getBatchSize());
             boolean ackMode = properties.getUploader().getAck().isEnabled();
             if (ackMode && mqttPublisher.getClientManager() != null) {
                 mqttPublisher.getClientManager().ensureAckSubscription(ship.mmsi());
             }
 
-            List<Map<String, Object>> rows = jdbcTemplate.query(
-                    "SELECT * FROM " + stream.tableName() + " WHERE id > ? ORDER BY id ASC LIMIT ?",
-                    (rs, rowNum) -> toMap(rs),
-                    lastId, limit
-            );
+            List<Map<String, Object>> rows = repository.incremental(
+                    stream.tableName(), lastId, limit);
 
             if (rows.isEmpty()) {
                 // 本轮无新行：期间到达的 ACK 仍可能推进 watermark。
                 if (ackMode) {
-                    advanceWatermark(jdbcTemplate, ship, stream, lastId);
+                    advanceWatermark(repository, ship, stream, lastId);
                 }
                 return;
             }
@@ -235,11 +228,11 @@ public class DatabaseUploadPoller {
             }
 
             if (ackMode) {
-                resendTimedOut(jdbcTemplate, ship, stream, limit);
-                advanceWatermark(jdbcTemplate, ship, stream, lastId);
+                resendTimedOut(repository, ship, stream, limit);
+                advanceWatermark(repository, ship, stream, lastId);
             } else if (maxSuccessId > lastId) {
                 // 旧语义（ACK 关闭）：PUBACK 即推进游标。
-                updateCursorId(jdbcTemplate, stream.tableName(), maxSuccessId);
+                updateCursorId(repository, stream.tableName(), maxSuccessId);
                 log.info("[Uploader] 上传成功: shipId={}, table={}, count={}, 游标推进: {} -> {}",
                         ship.shipId(), stream.tableName(), successCount, lastId, maxSuccessId);
             }
@@ -276,11 +269,11 @@ public class DatabaseUploadPoller {
     }
 
     /** 连续 ACK watermark 能推进才写游标；乱序缺口前停住等补发。 */
-    private void advanceWatermark(JdbcTemplate jdbcTemplate, LocalShip ship,
+    private void advanceWatermark(EdgeTelemetryRepository repository, LocalShip ship,
                                  IncrementalStream stream, long lastId) {
         long watermark = ackTracker.watermark(ship.mmsi(), stream.tableName(), lastId);
         if (watermark > lastId) {
-            updateCursorId(jdbcTemplate, stream.tableName(), watermark);
+            updateCursorId(repository, stream.tableName(), watermark);
             log.info("[Uploader] ACK watermark 推进: shipId={}, table={}, 游标: {} -> {}",
                     ship.shipId(), stream.tableName(), lastId, watermark);
         }
@@ -290,7 +283,7 @@ public class DatabaseUploadPoller {
      * 超时未 ACK 的补发（限本轮 batchSize 条）：按 id 回查原行重发，msg_id 由业务键
      * 确定故与之前完全相同，岸端去重吸收。行已不在（被清理）则放弃跟踪。
      */
-    private void resendTimedOut(JdbcTemplate jdbcTemplate, LocalShip ship,
+    private void resendTimedOut(EdgeTelemetryRepository repository, LocalShip ship,
                                 IncrementalStream stream, int limit) {
         List<UploadAckTracker.Tracked> due = ackTracker.resendDue(
                 ship.mmsi(), stream.tableName(),
@@ -298,7 +291,7 @@ public class DatabaseUploadPoller {
         int n = Math.min(due.size(), Math.max(1, limit));
         for (int i = 0; i < n; i++) {
             UploadAckTracker.Tracked t = due.get(i);
-            Map<String, Object> row = queryRowById(jdbcTemplate, stream.tableName(), t.rowId());
+            Map<String, Object> row = queryRowById(repository, stream.tableName(), t.rowId());
             if (row == null) {
                 log.warn("[Uploader] 补发行已不在，放弃跟踪: table={}, id={}",
                         stream.tableName(), t.rowId());
@@ -322,12 +315,8 @@ public class DatabaseUploadPoller {
         }
     }
 
-    private Map<String, Object> queryRowById(JdbcTemplate jdbcTemplate, String table, long rowId) {
-        List<Map<String, Object>> rows = jdbcTemplate.query(
-                "SELECT * FROM " + table + " WHERE id = ?",
-                (rs, rowNum) -> toMap(rs),
-                rowId);
-        return rows.isEmpty() ? null : rows.get(0);
+    private Map<String, Object> queryRowById(EdgeTelemetryRepository repository, String table, long rowId) {
+        return repository.byId(table, rowId);
     }
 
     private void prepareRow(LocalShip ship, Map<String, Object> row) {
@@ -336,59 +325,15 @@ public class DatabaseUploadPoller {
         row.putIfAbsent("source_database", "local");
     }
 
-    private void ensureCursorTable(JdbcTemplate jdbcTemplate) {
-        jdbcTemplate.execute("""
-            CREATE TABLE IF NOT EXISTS zncb_upload_cursor (
-                stream_name VARCHAR(64) NOT NULL,
-                partition_key VARCHAR(64) NOT NULL DEFAULT '',
-                last_uploaded_id BIGINT NOT NULL DEFAULT 0,
-                last_uploaded_time DATETIME NULL,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                PRIMARY KEY (stream_name, partition_key)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """);
+    private void ensureCursorTable(EdgeTelemetryRepository repository) {
+        repository.ensureCursorTable();
     }
 
-    private long getOrCreateCursorId(JdbcTemplate jdbcTemplate, String tableName) {
-        List<Long> results = jdbcTemplate.query(
-                "SELECT last_uploaded_id FROM zncb_upload_cursor WHERE stream_name = ? AND partition_key = ''",
-                (rs, rowNum) -> rs.getLong(1),
-                tableName
-        );
-        if (!results.isEmpty()) {
-            return results.get(0);
-        }
-        long initialId = 0L;
-        jdbcTemplate.update(
-                "INSERT INTO zncb_upload_cursor (stream_name, partition_key, last_uploaded_id, updated_at) VALUES (?, '', ?, NOW())",
-                tableName, initialId
-        );
-        return initialId;
+    private long getOrCreateCursorId(EdgeTelemetryRepository repository, String tableName) {
+        return repository.getOrCreateCursor(tableName);
     }
 
-    private void updateCursorId(JdbcTemplate jdbcTemplate, String tableName, long lastId) {
-        jdbcTemplate.update(
-                "UPDATE zncb_upload_cursor SET last_uploaded_id = ?, updated_at = NOW() WHERE stream_name = ? AND partition_key = ''",
-                lastId, tableName
-        );
-    }
-
-    private Map<String, Object> toMap(ResultSet rs) {
-        try {
-            ResultSetMetaData meta = rs.getMetaData();
-            int count = meta.getColumnCount();
-            Map<String, Object> map = new LinkedHashMap<>(count);
-            for (int i = 1; i <= count; i++) {
-                String label = meta.getColumnLabel(i);
-                Object val = rs.getObject(i);
-                if (val instanceof Timestamp ts) {
-                    val = ts.toLocalDateTime();
-                }
-                map.put(label.toLowerCase(), val);
-            }
-            return map;
-        } catch (Exception e) {
-            throw new IllegalStateException("ResultSet 转换 Map 失败: " + e.getMessage(), e);
-        }
+    private void updateCursorId(EdgeTelemetryRepository repository, String tableName, long lastId) {
+        repository.updateCursor(tableName, lastId);
     }
 }
